@@ -5,3 +5,6 @@ paper_figs/
 outputs/
 
 *.tex
+# pixi environments
+.pixi/*
+!.pixi/config.toml

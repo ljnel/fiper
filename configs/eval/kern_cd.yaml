@@ -1,0 +1,22 @@
+defaults:
+  - base
+
+required_tensors:
+  - "obs_embeddings"
+
+# Score on the raw observation embeddings, matching rnd_oe.
+normalize_tensors:
+  obs_embeddings: False
+
+# KernCD support-estimator hyperparameters
+gamma: "median"   # RBF bandwidth heuristic (or a float)
+lam: 1.0e-5       # ridge / GP noise (sigma^2 = lam * m)
+rank: null        # null => exact O(m^3) path (calibration sets are small)
+pivot: "rp"       # only used on the low-rank path (rank set)
+
+hparams:
+  model:
+    gamma: ${eval.gamma}
+    lam: ${eval.lam}
+    rank: ${eval.rank}
+    pivot: ${eval.pivot}

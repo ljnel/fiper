@@ -65,6 +65,7 @@ filter_values:
     - rnd_a
     - similarity
     - rnd_oe_and_entropy
+    - kern_cd
     # - rnd_oe_or_entropy
   Quantile: # Float values or "best" for the best value
     # - best

@@ -7,7 +7,7 @@ defaults:
 # Methods to evaluate for tasks (methods are extended by rnd_models)
 tasks: ["sorting", "stacking", "push_t" ,"pretzel","push_chair"] 
 rnd_models: ["rnd_oe", "rnd_a"]
-methods: ["entropy", "similarity", "tc", "logpzo"]
+methods: ["entropy", "similarity", "tc", "logpzo", "kern_cd"]
 
 # Whether to logically combine the methods and how
 combine_methods: True
@@ -39,5 +39,5 @@ train_rnd: True
 
 # For input verification
 available_tasks: ["push_t", "pretzel", "push_chair", "sorting", "stacking"]
-implemented_methods: ["rnd_oe", "rnd_a", "entropy", "tc", "similarity", "logpzo"]
+implemented_methods: ["rnd_oe", "rnd_a", "entropy", "tc", "similarity", "logpzo", "kern_cd"]
 available_rnd_models: ["rnd_oe", "rnd_a"]

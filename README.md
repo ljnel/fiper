@@ -14,6 +14,14 @@ Luca Worbis<sup>1</sup>,
 
 The official code repository for *"Failure Prediction at Runtime for Generative Robot Policies,"* accepted to NeurIPS 2025.
 
+> [!NOTE]
+> **This is a modified copy of [`learnsyslab/fiper`](https://github.com/learnsyslab/fiper).**
+> All original code, documentation, datasets, and results are the work of the FIPER
+> authors listed above and remain under their [MIT License](LICENSE). This copy adds one
+> extra failure-prediction method, `kern_cd`, which is **not** part of the published
+> paper — any shortcomings of that method are not attributable to the FIPER authors.
+> If you use this repository, please cite FIPER (see the Citation section below).
+
 <img src="fiper_dark.png" alt="FIPER"/>
 
 
