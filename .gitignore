@@ -8,3 +8,4 @@ outputs/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+scratchpad/

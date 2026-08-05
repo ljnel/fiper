@@ -148,8 +148,12 @@ class ResultsManager:
             - Metric 2
             - ...
         """
-        # Create a DataFrame from the results
-        complete_df = pd.DataFrame()
+        # Create a DataFrame from the results.  Rows are accumulated in a list and
+        # the DataFrame is built once at the end: concatenating a fresh one-row
+        # DataFrame per iteration is O(n^2) (it recopies the whole growing frame
+        # every row), which on the full results store balloons to tens of GB and
+        # many minutes.  Accumulate-then-build is O(n) and byte-identical.
+        all_rows = []
         # Obtain the available results
         filenames = _get_filenames(self.method_results_dir, keywords="_results", data_types="pkl")
         methods = [filename.split("_results.pkl")[0] for filename in filenames]
@@ -203,9 +207,9 @@ class ResultsManager:
                                         # for k, v in value.get("percentiles", {}).items():
                                         #     row[keyword + " P" + str(k)] = v
 
-                                complete_df = pd.concat([complete_df, pd.DataFrame([row])], ignore_index=True)
+                                all_rows.append(row)
 
-        complete_df = complete_df.round(3)
+        complete_df = pd.DataFrame(all_rows).round(3) if all_rows else pd.DataFrame()
         return complete_df
 
     def combine_results(self, new_results: dict = {}, method_names: list = [], **kwargs) -> None:
