@@ -22,11 +22,27 @@ jupyterlab = "*"
 ipykernel = "*"
 plotly = ">=6.8.0,<7"
 dash = ">=4.2.0,<5"
+# ksig dependency; from conda-forge so it satisfies ksig's `cupy>=12.2.0`
+# requirement without building the PyPI sdist. Needs nvrtc >=12.8 for sm_120.
+cupy = ">=14.1.1,<15"
+# Must stay 12.8: numba-cuda resolves libnvJitLink from torch's pip wheel
+# (nvidia-nvjitlink-cu12 12.8.x), which rejects NVVM IR from a newer libnvvm.
+cuda-version = "12.8.*"
+# ksig's algorithms.py imports numba.cuda but doesn't declare it. numba caps
+# numpy <2.5, so numpy is held one minor behind latest.
+numba = "*"
+numba-cuda = "*"
 
 [pypi-dependencies]
 # cu128 wheel from PyPI, not conda-forge: needs sm_120 kernels (RTX 5090)
 torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" }
 cd_project = { git = "https://github.com/ljnel/cd_project", branch = "main" }
+ksig = { git = "https://github.com/tgcsaba/KSig", branch = "main" }
+
+[pypi-options]
+# ksig pins numpy==1.24.4 (no cp312 wheels) and tqdm==4.66.1; both are provided
+# by conda-forge here, so relax the pins rather than let the solve fail.
+dependency-overrides = { numpy = ">=2.0", tqdm = ">=4.66.1" }
 
 [tasks]
 fiper = "python scripts/run_fiper.py"
