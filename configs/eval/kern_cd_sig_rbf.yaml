@@ -1,0 +1,54 @@
+defaults:
+  - base
+
+# Joint obs + action-chunk KernCD with an RBF (characteristic) signature kernel
+# on the action chunks, instead of the linear one used by kern_cd_sig
+# (docs/kern_cd_action_channel.md).  The per-step action feature is the RBF
+# kernel *mean embedding* of the B chunk signatures, realised via random Fourier
+# features, so the action channel sees the full chunk distribution rather than
+# only its mean (which the linear embedding collapses to).
+required_tensors:
+  - "obs_embeddings"
+  - "action_preds"
+
+# Position channels only. Override the base optional_actions ([rotation]).
+required_actions:
+  - "position"
+optional_actions: []
+
+normalize_tensors:
+  obs_embeddings: False
+  action_preds: False
+
+# KernCD support estimator (RBF on the standardised joint feature).
+kernel: "rbf"
+gamma: "median"
+lam: 1.0e-5
+rank: null
+pivot: "rp"
+
+# Action-chunk channel: RBF-on-signature-features mean embedding.
+action_feature: "signature_rbf"
+sig_level: 2
+sig_time_aug: True
+sig_rff_dim: 128         # random Fourier features approximating the RBF mean embedding
+sig_rff_gamma: "median"  # bandwidth on signature features, fit on calibration
+# g_a / g_o, applied after per-block standardisation + 1/sqrt(dim) balancing.
+# 1.0 = exact equal contribution of the obs and action blocks (frozen default,
+# chosen a priori; not selected on data - see docs/kern_cd_action_channel.md, A).
+block_ratio: 1.0
+
+hparams:
+  model:
+    kernel: ${eval.kernel}
+    gamma: ${eval.gamma}
+    lam: ${eval.lam}
+    rank: ${eval.rank}
+    pivot: ${eval.pivot}
+    action_feature: ${eval.action_feature}
+    sig_level: ${eval.sig_level}
+    sig_time_aug: ${eval.sig_time_aug}
+    sig_rff_dim: ${eval.sig_rff_dim}
+    sig_rff_gamma: ${eval.sig_rff_gamma}
+    block_ratio: ${eval.block_ratio}
+    seed: 0

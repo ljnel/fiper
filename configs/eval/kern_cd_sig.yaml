@@ -1,0 +1,45 @@
+defaults:
+  - base
+
+# Joint obs + action-chunk KernCD, rung 2 (docs/kern_cd_action_channel.md).
+required_tensors:
+  - "obs_embeddings"
+  - "action_preds"
+
+# Position channels only (doc: "position channels only"). Override the base
+# optional_actions ([rotation]) so the action feature is not silently widened.
+required_actions:
+  - "position"
+optional_actions: []
+
+normalize_tensors:
+  obs_embeddings: False
+  action_preds: False
+
+# KernCD support estimator (RBF on the standardised joint feature).
+kernel: "rbf"
+gamma: "median"
+lam: 1.0e-5
+rank: null
+pivot: "rp"
+
+# Action-chunk channel.
+action_feature: "signature"   # rung 2: level-2 truncated signature mean embedding
+sig_level: 2
+sig_time_aug: True
+# g_a / g_o, applied after per-block standardisation + 1/sqrt(dim) balancing.
+# 1.0 = exact equal contribution of the obs and action blocks (frozen default,
+# chosen a priori; not selected on data - see docs/kern_cd_action_channel.md, A).
+block_ratio: 1.0
+
+hparams:
+  model:
+    kernel: ${eval.kernel}
+    gamma: ${eval.gamma}
+    lam: ${eval.lam}
+    rank: ${eval.rank}
+    pivot: ${eval.pivot}
+    action_feature: ${eval.action_feature}
+    sig_level: ${eval.sig_level}
+    sig_time_aug: ${eval.sig_time_aug}
+    block_ratio: ${eval.block_ratio}

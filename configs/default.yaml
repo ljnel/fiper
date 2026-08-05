@@ -39,5 +39,5 @@ train_rnd: True
 
 # For input verification
 available_tasks: ["push_t", "pretzel", "push_chair", "sorting", "stacking"]
-implemented_methods: ["rnd_oe", "rnd_a", "entropy", "tc", "similarity", "logpzo", "kern_cd"]
+implemented_methods: ["rnd_oe", "rnd_a", "entropy", "tc", "similarity", "logpzo", "kern_cd", "kern_cd_poly", "kern_cd_disp", "kern_cd_sig", "kern_cd_sig_rbf"]
 available_rnd_models: ["rnd_oe", "rnd_a"]

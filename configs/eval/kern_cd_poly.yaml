@@ -1,0 +1,29 @@
+defaults:
+  - base
+
+required_tensors:
+  - "obs_embeddings"
+
+# Score on the raw observation embeddings, matching rnd_oe / kern_cd (rbf).
+normalize_tensors:
+  obs_embeddings: False
+
+# KernCD support-estimator hyperparameters (polynomial kernel).
+# Inhomogeneous polynomial: k(x,y) = (gamma*<x,y> + coef0)^degree.
+kernel: "poly"
+degree: 3
+gamma: "dimension"   # gamma = 1/d, keeps gamma*<x,y> ~ O(1) on un-normalized embeddings
+coef0: 1.0
+lam: 1.0e-5          # ridge / GP noise (sigma^2 = lam * m)
+rank: null           # null => exact O(m^3) path (calibration sets are small); required for LOO
+pivot: "rp"          # only used on the low-rank path (rank set)
+
+hparams:
+  model:
+    kernel: ${eval.kernel}
+    degree: ${eval.degree}
+    gamma: ${eval.gamma}
+    coef0: ${eval.coef0}
+    lam: ${eval.lam}
+    rank: ${eval.rank}
+    pivot: ${eval.pivot}

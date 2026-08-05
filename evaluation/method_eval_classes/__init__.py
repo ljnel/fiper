@@ -10,6 +10,7 @@ from .logpzo_eval import *
 # and breaks `import evaluation` outright, taking every other method down with it.
 try:
     from .kerncd_eval import *
+    from .kerncd_joint_eval import *
 except ImportError as _err:
     import warnings
 
@@ -39,5 +40,8 @@ except ImportError as _err:
                 "github.com/ljnel/cd_project), or remove 'kern_cd' from `methods` in "
                 "configs/default.yaml."
             )
+
+    # The joint action-channel variants share kern_cd's dependency; stub them too.
+    KERNCDJOINTEval = KERNCDDISPEval = KERNCDSIGEval = KERNCDSIGRBFEval = KERNCDEval
 
 

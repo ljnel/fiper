@@ -2,7 +2,7 @@ from .base_eval_class import BaseEvalClass
 import numpy as np
 from scipy.linalg import solve_triangular
 from cd.algs.kern_cd import KernCD
-from cd.algs.kernels import RBF
+from cd.algs.kernels import RBF, Polynomial
 
 
 class KERNCDEval(BaseEvalClass):
@@ -34,8 +34,22 @@ class KERNCDEval(BaseEvalClass):
         )["obs_embeddings"]
         X = np.asarray(obs_embeddings)
 
+        # Kernel is selectable via config (`kernel: rbf|poly`); the LOO closed
+        # form below is kernel-agnostic (it never references k(x,x)), so both work.
+        kernel_type = self.cfg.get("kernel", "rbf")
+        if kernel_type == "rbf":
+            kernel = RBF(gamma=self.cfg.get("gamma", "median"))
+        elif kernel_type == "poly":
+            kernel = Polynomial(
+                degree=self.cfg.get("degree", 3),
+                gamma=self.cfg.get("gamma", "dimension"),
+                coef0=self.cfg.get("coef0", 1.0),
+            )
+        else:
+            raise ValueError(f"Unknown kernel '{kernel_type}' (expected 'rbf' or 'poly').")
+
         self.model = KernCD(
-            kernel=RBF(gamma=self.cfg.get("gamma", "median")),
+            kernel=kernel,
             lam=self.cfg.get("lam", 1e-5),
             rank=self.cfg.get("rank", None),  # None => exact O(m^3) path
             pivot=self.cfg.get("pivot", "rp"),
@@ -135,3 +149,9 @@ class KERNCDEval(BaseEvalClass):
             obs_embeddings = obs_embeddings[0]
         obs_embedding = np.asarray(obs_embeddings[-self.embedding_dim:]).reshape(1, -1)
         return float(self.model.score(obs_embedding)[0])
+
+
+# Method-name resolution maps `kern_cd_poly` -> class `KERNCDPOLYEval`
+# (see EvaluationManager._get_method_eval_class). It reuses the same eval class;
+# the kernel is chosen from config (`kernel: poly`).
+KERNCDPOLYEval = KERNCDEval
