@@ -5,6 +5,8 @@ paper_figs/
 outputs/
 
 *.tex
+# large binary docs (kept on disk, out of git history)
+docs/*.pdf
 # pixi environments
 .pixi/*
 !.pixi/config.toml
