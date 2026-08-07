@@ -34,9 +34,10 @@ fit(calib)      once, before scoring.
                 Use episode_lengths to recover per-rollout structure:
                     np.split(X, np.cumsum(lengths)[:-1])
 
-                NOTE: the calibration split is NOT all-nominal. On push_t only 21 of
-                50 calibration rollouts succeeded. FIPER's own methods fit on all of
-                them; if your method estimates a *nominal* support region, filter on
+                NOTE: on push_t, only 21 of 50 calibration rollouts succeeded; the
+                other four tasks have all-successful calibration splits. FIPER's own
+                methods fit on all calibration rollouts regardless. If your method
+                estimates a support region for successful behaviour, filter on
                 calib["successful"] yourself.
 
 score(step)     per rollout step, returns a float. Higher = more anomalous.
@@ -60,6 +61,15 @@ score_rollout(rollout)  implement INSTEAD of score() to score a whole rollout at
                         (T, B, H, A), and you return T floats. Use it when per-step
                         calls waste work -- for kernel methods that share a
                         factorisation across queries this is worth ~30x.
+
+score_subset(subset)    the same idea one level coarser, and it takes precedence over
+                        score_rollout. You get the whole pass at once -- exactly the
+                        dict fit() receives, including episode_lengths -- and return
+                        one score per step, in the order iterate_episodes visits them.
+                        Reach for it when a rollout is too small to amortise a fixed
+                        per-call cost: the kern_cd methods re-stream an m x m Cholesky
+                        factor per call, which costs 32s per rollout-sized block on
+                        stacking against 5s for the same arithmetic in large blocks.
 
 self.subset             "calibration" or "test", set before each pass, if the two
                         must be scored differently (e.g. leave-one-out on your own

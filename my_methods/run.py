@@ -1,7 +1,7 @@
 """Runner for methods defined in ``my_methods/methods/``.
 
     python -m my_methods.run <name> --task push_t        # quick: one task, one seed
-    python -m my_methods.run <name> --full               # all tasks, all seeds
+    python -m my_methods.run <name> [<name> ...] --full  # all tasks, all seeds
     python -m my_methods.run --list                      # show registered methods
 
 Quick mode is the iteration loop: it loads the cached processed dataset, evaluates one
@@ -9,9 +9,14 @@ task with one seed, and prints the metric table directly from the returned resul
 deliberately does not touch ``data/results/`` -- writing there triggers a rescan of the
 whole (multi-GB) results store.
 
-``--full`` reproduces what ``scripts/run_fiper.py`` does for a single method: every task,
-every seed from ``eval/base.yaml``, results merged into ``data/results/`` so the method
-shows up in ``complete_results.csv`` alongside the built-in ones.
+``--full`` reproduces what ``scripts/run_fiper.py`` does: every task, every seed from
+``eval/base.yaml``, results merged into ``data/results/`` so the methods show up in
+``complete_results.csv`` alongside the built-in ones.
+
+Naming several methods at once is much cheaper than running them one at a time. The
+processed dataset is built once per task and shared (~12 s per avoided rebuild), and
+``combine_results`` -- which unpickles the entire results store to rebuild the CSV --
+runs once instead of once per method.
 """
 
 from __future__ import annotations
@@ -83,20 +88,27 @@ class _RegistryEvaluationManager(EvaluationManager):
         )
 
 
-def _evaluate_task(name: str, task: str, seed: int, param_overrides: dict) -> dict:
-    """Evaluate one method on one task with one seed. Returns FIPER's results dict."""
+def _evaluate_task(names: list[str], task: str, seed: int, param_overrides: dict) -> dict:
+    """Evaluate the named methods on one task with one seed.
+
+    Returns FIPER's ``{method_name: results}`` dict. The dataset is built once and shared
+    across the methods, so the tensors requested are the union of what they declare --
+    each method's own config still selects from that, so an obs-only method is unaffected
+    by an action-channel method being in the same call.
+    """
     set_seed(seed)
     cfg = load_config("task", task, return_only_subdict=False)
     task_data_path = os.path.join(BASE_DATA_PATH, task)
 
-    method_cls = REGISTRY[name]
+    required = _union(names, "tensors")
+    optional = _union(names, "optional_tensors")
     taskmanager = TaskManager(
         cfg,
         task,
         BASE_CONFIG_PATH,
         task_data_path,
-        required_tensors=list(method_cls.tensors),
-        optional_tensors=list(method_cls.optional_tensors),
+        required_tensors=required,
+        optional_tensors=optional,
         device=_device(),
     )
     # load_dataset_if_exists=False matches scripts/run_fiper.py. Loading the cached
@@ -114,7 +126,17 @@ def _evaluate_task(name: str, task: str, seed: int, param_overrides: dict) -> di
         seed=seed,
         param_overrides=param_overrides,
     )
-    return manager.evaluate([name], combine_methods=False)
+    return manager.evaluate(list(names), combine_methods=False)
+
+
+def _union(names: list[str], attr: str) -> list[str]:
+    """Declared tensors across ``names``, in first-seen order."""
+    out: list[str] = []
+    for name in names:
+        for item in getattr(REGISTRY[name], attr):
+            if item not in out:
+                out.append(item)
+    return out
 
 
 def _device() -> str:
@@ -183,7 +205,7 @@ def _parse_params(pairs: list[str]) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="my_methods.run", description=__doc__)
-    parser.add_argument("method", nargs="?", help="registered method name")
+    parser.add_argument("methods", nargs="*", help="registered method name(s)")
     parser.add_argument("--task", default="push_t", choices=ALL_TASKS, help="task for quick mode")
     parser.add_argument("--full", action="store_true", help="all tasks, all seeds, into data/results/")
     parser.add_argument("--seed", type=int, default=0, help="seed for quick mode")
@@ -192,7 +214,7 @@ def main(argv=None) -> int:
         type=int,
         default=None,
         metavar="N",
-        help="--full: use only the first N seeds (overrides the method's `deterministic`)",
+        help="--full: use only the first N seeds (overrides the methods' `deterministic`)",
     )
     parser.add_argument("--param", action="append", default=[], metavar="K=V", help="override a params entry")
     parser.add_argument("--list", action="store_true", help="list registered methods and exit")
@@ -200,14 +222,15 @@ def main(argv=None) -> int:
 
     discover()
 
-    if args.list or not args.method:
+    if args.list or not args.methods:
         print("Registered methods:")
         for name, cls in sorted(REGISTRY.items()):
             print(f"  {name:<20} {cls.__module__}")
         return 0
 
-    if args.method not in REGISTRY:
-        print(f"Unknown method '{args.method}'. Registered: {sorted(REGISTRY)}", file=sys.stderr)
+    unknown = [m for m in args.methods if m not in REGISTRY]
+    if unknown:
+        print(f"Unknown method(s) {unknown}. Registered: {sorted(REGISTRY)}", file=sys.stderr)
         return 1
 
     overrides = _parse_params(args.param)
@@ -215,34 +238,36 @@ def main(argv=None) -> int:
         print(f"param overrides: {overrides}")
 
     if not args.full:
-        results = _evaluate_task(args.method, args.task, args.seed, overrides)
-        _report(args.method, args.task, results)
+        results = _evaluate_task(args.methods, args.task, args.seed, overrides)
+        for name in args.methods:
+            _report(name, args.task, results)
         return 0
 
-    # Full run: mirrors scripts/run_fiper.py for a single method.
+    # Full run: mirrors scripts/run_fiper.py.
     base_cfg = load_config("eval", "base", return_only_subdict=True, base_config_dir=BASE_CONFIG_PATH)
     seeds = list(base_cfg.get("random_seeds", [0, 1, 2]))
     if args.seeds is not None:
         seeds = seeds[: max(1, args.seeds)]
-    elif REGISTRY[args.method].deterministic:
-        # Repeated seeds of a deterministic method reproduce the same numbers exactly,
-        # so the remaining passes cost time and change nothing.
+    elif all(REGISTRY[m].deterministic for m in args.methods):
+        # Repeated seeds of a deterministic method reproduce the same numbers exactly, so
+        # the remaining passes cost time and change nothing. One stochastic method in the
+        # call is enough to need them all -- the seed loop is shared.
         seeds = seeds[:1]
-        print(f"{args.method} is declared deterministic -- running 1 seed instead of {len(base_cfg.random_seeds)}")
+        print(f"all methods are declared deterministic -- running 1 seed instead of {len(base_cfg.random_seeds)}")
     all_seed_results = []
     for seed in seeds:
         print(f"-------------- Seed: {seed} ----------------")
         per_task = {}
         for task in ALL_TASKS:
             print(f"-------------- Task: {task} ----------------")
-            per_task[task] = _evaluate_task(args.method, task, seed, overrides)
+            per_task[task] = _evaluate_task(args.methods, task, seed, overrides)
         all_seed_results.append(per_task)
 
     resultsmanager = ResultsManager(BASE_CONFIG_PATH, BASE_DATA_PATH)
     total_results = resultsmanager.accumulate_seed_results(all_seed_results)
-    resultsmanager.combine_results(total_results, method_names=[args.method])
+    resultsmanager.combine_results(total_results, method_names=list(args.methods))
     resultsmanager.create_summary()
-    print(f"\n{args.method} merged into data/results/complete_results.csv")
+    print(f"\n{', '.join(args.methods)} merged into data/results/complete_results.csv")
     return 0
 
 

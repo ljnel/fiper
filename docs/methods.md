@@ -1,178 +1,149 @@
 # Methods
 
-Idealized descriptions of the methods in [my_methods/methods/](../my_methods/methods/).
-Implementation details (batching, dtypes, standardisation epsilons) are omitted.
+What [my_methods/methods/](../my_methods/methods/) implements, as mathematics. The
+specification these are built from is [specs/methods.md](../specs/methods.md); this file
+is the same content with the shared machinery written out once, and it omits
+implementation detail (batching, dtypes, block sizes).
 
 ## Setup
 
-A rollout step $t$ carries
+A rollout step $t$ carries an observation embedding and a batch of $B$ sampled action
+chunks, each a length-$H$ path in Cartesian position space:
 
 $$
-o_t \in \mathbb{R}^{d_o}, \qquad
-A_t = \big(a^{(1)}_t, \dots, a^{(B)}_t\big), \qquad
-a^{(b)}_t = \big(a^{(b)}_{t,1}, \dots, a^{(b)}_{t,H}\big) \in \mathbb{R}^{H \times 3},
+o \in \mathbb{R}^{d_o},
+\qquad
+A = \big(a_1, \dots, a_B\big),
+\qquad
+a_b = \big(a_{b1}, \dots, a_{bH}\big) \in \mathbb{R}^{H \times 3}.
 $$
 
-an observation embedding and a batch of $B$ sampled action chunks, each a length-$H$ path
-in position space. Calibration gives $m$ such steps, $\{(o_i, A_i)\}_{i=1}^m$.
-
-Every method below is: **a feature map $z = \Phi(o, A)$, plus a kernel $k$ on it**. kern_cd is
-then fitted on $Z = \{z_i\}_{i=1}^m$ and its score
+Every method is a **kernel** $k$ on the pair $(o, A)$, plus one shared support estimator.
+Calibration supplies $m$ steps; kern_cd is fitted on them and scores a query by its GP
+posterior variance,
 
 $$
-s(z) \;=\; k(z,z) - k_Z(z)^\top (K + \lambda m I)^{-1} k_Z(z),
+s(x) \;=\; k(x,x) \;-\; k_x^\top \big(K + m\lambda I\big)^{-1} k_x,
 \qquad \lambda = 10^{-5},
 $$
 
-is the per-step anomaly score (FIPER windows and thresholds it downstream). Calibration steps
-are scored leave-one-out, in closed form:
+which FIPER then windows and thresholds downstream. Only per-step scores are produced
+here; combining across time is not this code's business.
+
+Two properties of the fit are worth stating explicitly.
+
+**Leave-one-out calibration.** An exact kernel estimator interpolates its own fit set, so
+in-sample calibration scores collapse toward zero and would deflate every conformal
+threshold. Calibration steps are therefore scored with each point held out, in closed
+form,
 
 $$
-s^{\mathrm{LOO}}_i \;=\; \frac{1}{\big[(K + \lambda m I)^{-1}\big]_{ii}} - \lambda m .
+s^{\mathrm{LOO}}_i \;=\; \frac{1}{\big[(K + m\lambda I)^{-1}\big]_{ii}} \;-\; m\lambda ,
 $$
 
-Bandwidths written $\gamma_\bullet$ are set by the median heuristic on calibration data,
-$\gamma = 1/(2\,\mathrm{med}^2)$ with $\mathrm{med}$ the median pairwise distance.
+an identity that never references $k(x,x)$ and so holds for every kernel below unchanged.
 
-| name | $\Phi$ | $k$ |
-|---|---|---|
-| `example` | $o$ | — (Mahalanobis, no kern_cd) |
-| `kern_cd_rbf` | $o$ | RBF |
-| `kern_cd_poly` | $o$ | polynomial, degree 3 |
-| `kern_cd_rbf_disp` | $[\,o \mid \text{chunk displacement}\,]$ | RBF |
-| `kern_cd_rbf_sig` | $[\,o \mid \text{mean chunk signature}\,]$ | RBF |
-| `kern_cd_rbf_sigk` | $[\,o \mid \text{mean embedding of chunk signatures}\,]$ | RBF |
-| `kern_cd_prod` | $(o, A)$ | $\text{RBF}(o,o') \cdot \langle \hat\mu_A, \hat\mu_{A'}\rangle$ |
-| `kern_cd_prod_pool` | $(o, A)$ | same, horizon-pooled |
+**Successful episodes only.** push_t's calibration split contains 29 failed rollouts out
+of 50; a support estimate for *successful* behaviour is fitted on the other 21 (350 of
+1452 steps). FIPER's own threshold calibration already discards failed episodes, so this
+makes the fit set and the calibration set agree. The other four tasks are all-successful
+and the filter is a no-op.
 
----
+## The kernel
 
-## `example`
-
-Reference implementation of the method contract; no kernel.
+The observation factor is common to all five:
 
 $$
-\hat\mu = \frac{1}{m}\sum_i o_i, \qquad
-\hat\Sigma_\epsilon = \hat\Sigma + \epsilon\,\frac{\operatorname{tr}\hat\Sigma}{d_o} I,
+k_o(o, o') = \exp\!\left(-\frac{\|o - o'\|^2}{2\sigma_o^2}\right).
+$$
+
+`obs` is that factor alone. The other four multiply it by an action factor, an RBF on a
+vector **kernel mean embedding** $\mu_A$ of the chunk batch:
+
+$$
+k\big((o,A),(o',A')\big)
+= \exp\!\left(-\frac{\|o-o'\|^2}{2\sigma_o^2}\right)
+\exp\!\left(-\frac{\|\mu_A-\mu_{A'}\|^2}{2\sigma_A^2}\right).
+$$
+
+Since a product of RBFs is one RBF on the concatenation of the rescaled blocks, all five
+are fitted as a single $\mathrm{RBF}(\gamma = 1/2)$ on
+
+$$
+z = \big[\, o/\sigma_o \;\big|\; \mu_A/\sigma_A \,\big],
+$$
+
+with the action block simply absent for `obs`. No custom kernel object is involved, and
+`obs` is exactly the $\mu_A \equiv \text{const}$ limit of the others.
+
+## The mean embeddings
+
+Each $\mu_A$ averages a Random Fourier Feature map $\varphi: \mathbb{R}^F \to
+\mathbb{R}^{128}$ over the *parts* of $A$, where
+
+$$
+\varphi(x) = \sqrt{\tfrac{2}{128}}\,\cos(W^\top x + b),
+\quad W \sim \mathcal{N}(0, \sigma_\varphi^{-2} I),\;\; b \sim \mathcal{U}[0, 2\pi),
 \qquad
-s(o) = (o - \hat\mu)^\top \hat\Sigma_\epsilon^{-1} (o - \hat\mu).
+\langle \varphi(x), \varphi(y)\rangle \approx \exp\!\left(-\frac{\|x-y\|^2}{2\sigma_\varphi^2}\right).
 $$
 
----
+The draw is seeded from the run seed, so the four action methods are genuinely stochastic
+across seeds; `obs` is deterministic. What differs between methods is only the choice of
+part:
 
-## `kern_cd_rbf`, `kern_cd_poly`
+| method | part | $F$ | $\mu_A$ |
+|---|---|---|---|
+| `kern_cd_obs` | — | — | — (observation factor only) |
+| `kern_cd_disp` | chunk displacement | $3$ | $\frac{1}{B}\sum_b \varphi(a_{bH}-a_{b1})$ |
+| `kern_cd_sig` | chunk level-2 signature | $16$ | $\frac{1}{B}\sum_b \varphi\big(S^{2}(\hat a_b)\big)$ |
+| `kern_cd_flat` | flattened chunk | $3H$ | $\frac{1}{B}\sum_b \varphi\big(\operatorname{vec}(a_b)\big)$ |
+| `kern_cd_sum` | single action | $3$ | $\frac{1}{BH}\sum_b\sum_h \varphi(a_{bh})$ |
 
-Observation embeddings only, $z = o$:
+They separate cleanly along two axes. `disp` keeps only the endpoints; the other three
+keep the whole chunk. Of those, `flat` is strictly time-aligned (the distance behind
+$\varphi$ compares step $h$ to step $h$ and nothing else), `sum` is permutation-invariant
+in $h$ and so blind to ordering, and `sig` keeps ordering through iterated integrals
+rather than through alignment.
+
+### The signature term
+
+`sig` uses the **level-2 term only** of the truncated path signature; levels 0 and 1 are
+discarded. Level 0 is the constant $1$. Level 1 is the increment $a_{bH}-a_{b1}$, which is
+exactly what `kern_cd_disp` already isolates, so keeping it would prevent the two methods
+from separating. Level 2 is where path shape lives: for the augmented path $\hat a$,
 
 $$
-k_{\mathrm{rbf}}(o, o') = \exp\!\big(-\gamma_o \|o - o'\|^2\big),
+S^{2}(\hat a) = \iint_{u<v} d\hat a_u \otimes d\hat a_v \in \mathbb{R}^{4 \times 4},
+$$
+
+whose antisymmetric part is the signed area the chunk sweeps out — which distinguishes
+trajectories sharing endpoints but curving differently.
+
+Signatures are invariant to reparameterisation, so without a time channel a chunk that
+dawdles and one that moves steadily embed identically, and a chunk retracing its own path
+cancels to zero. A monotone channel breaks both:
+
+$$
+\hat a_{bh} = \Big(\theta\, a_{bh},\; \tfrac{h-1}{H-1}\Big) \in \mathbb{R}^4,
 \qquad
-k_{\mathrm{poly}}(o, o') = \Big(\tfrac{1}{d_o}\langle o, o'\rangle + 1\Big)^{3}.
+\theta = \Big(\operatorname{median}_{t,b} \textstyle\sum_h \|a_{b,h+1} - a_{bh}\|\Big)^{-1}.
 $$
 
----
+The channel spans $1$, so $\theta$ puts a typical chunk's spatial extent on the same
+footing. An *overall* scale would wash out — level 2 is quadratic in the path, so a global
+factor is a constant that the median heuristic inside $\varphi$ absorbs — but the
+space-to-time ratio does not, which is what $\theta$ fixes.
 
-## `kern_cd_rbf_disp`, `kern_cd_rbf_sig`, `kern_cd_rbf_sigk`
+## Hyperparameters
 
-Concatenate the observation with a per-step **action-chunk mean embedding**
-$\mu_t \in \mathbb{R}^{d_a}$, then run one RBF on the concatenation. Writing
-$\tilde{x} = (x - \hat{\mu}_x)/\hat\sigma_x$ for per-coordinate standardisation against
-calibration statistics,
+Everything is fixed a priori or set by the median heuristic; nothing is tuned on data.
 
-$$
-z_t = \Big[\;\frac{\tilde{o}_t}{\sqrt{d_o}} \;\;\Big|\;\; \sqrt{g_a}\,\frac{\tilde\mu_t}{\sqrt{d_a}}\;\Big],
-\qquad g_a = 1,
-$$
-
-so that after standardisation each block contributes equally to $\|z - z'\|^2$ regardless of its
-width. Because an RBF on a concatenation factorises, this is the **joint** kernel
-
-$$
-k(z, z') = \exp\!\big(-\gamma\|\tilde{o} - \tilde{o}'\|^2 / d_o\big)\cdot
-           \exp\!\big(-\gamma g_a \|\tilde\mu - \tilde\mu'\|^2 / d_a\big).
-$$
-
-The three variants differ only in $\mu_t$. Let $\hat{a}$ denote the time-augmented, dilated chunk
-
-$$
-\hat{a}_h = \Big(\theta\, a_h,\; \tfrac{h-1}{H-1}\Big) \in \mathbb{R}^{4},
-\qquad
-\theta = \Big(\operatorname{median}_{t,b} \textstyle\sum_h \|a_{h+1} - a_h\|\Big)^{-1},
-$$
-
-and $S^{\le 2}(\hat a) = \big(\int d\hat a,\; \iint d\hat a \otimes d\hat a\big) \in \mathbb{R}^{4 + 16}$
-its level-2 truncated signature.
-
-$$
-\begin{aligned}
-\textsf{disp:} \quad
-&\mu_t = \frac{1}{B}\sum_b \big(a^{(b)}_{t,H} - a^{(b)}_{t,1}\big) &&\in \mathbb{R}^{3} \\[4pt]
-\textsf{sig:} \quad
-&\mu_t = \frac{1}{B}\sum_b S^{\le 2}\big(\hat{a}^{(b)}_t\big) &&\in \mathbb{R}^{20} \\[4pt]
-\textsf{sigk:} \quad
-&\mu_t = \frac{1}{B}\sum_b \varphi\Big(S^{\le 2}\big(\hat{a}^{(b)}_t\big)\Big) &&\in \mathbb{R}^{128}
-\end{aligned}
-$$
-
-with $\varphi$ a random Fourier feature map (drawn once on calibration),
-
-$$
-\varphi(x) = \sqrt{\tfrac{2}{D}}\,\cos(W^\top x + b),
-\quad W \sim \mathcal{N}(0, 2\gamma_s I),\;\; b \sim \mathcal{U}[0, 2\pi],
-\quad \langle \varphi(x), \varphi(y)\rangle \approx e^{-\gamma_s\|x-y\|^2}.
-$$
-
-`sig` and `sigk` differ only in how the $B$ chunks are pooled: `sig` averages the signatures
-(keeping their mean), `sigk` averages a characteristic feature map (keeping the whole
-distribution of chunk signatures).
-
----
-
-## `kern_cd_prod`, `kern_cd_prod_pool`
-
-An explicit product kernel on $(o, A)$, with no standardisation or block balancing:
-
-$$
-k\big((o,A), (o',A')\big)
-= \underbrace{\exp\!\big(-\gamma_o\|o - o'\|^2\big)}_{k_{\mathrm{obs}}}
-\cdot \underbrace{\big\langle \hat\mu_A, \hat\mu_{A'} \big\rangle}_{k_{\mathrm{act}}} .
-$$
-
-With $\varphi: \mathbb{R}^3 \to \mathbb{R}^{d}$ an RFF map as above (bandwidth $\gamma_a$), the
-action embedding stacks the per-timestep features and is normalised:
-
-$$
-\mu_A = \frac{1}{B\sqrt{H}}\sum_b \bigoplus_{h=1}^{H} \varphi\big(a^{(b)}_h\big) \in \mathbb{R}^{H d},
-\qquad
-\hat\mu_A = \frac{\mu_A}{\|\mu_A\|},
-\qquad k_{\mathrm{act}}(A,A) = 1 .
-$$
-
-The direct sum $\bigoplus_h$ pairs timesteps only at **equal $h$**, so the implied per-chunk kernel
-is the time-aligned sum kernel and $k_{\mathrm{act}}$ is the cosine kernel between chunk-batch mean
-embeddings:
-
-$$
-k_{\mathrm{traj}}(x, y) = \sum_{h=1}^{H} \exp\!\big(-\gamma_a\|x_h - y_h\|^2\big),
-\qquad
-k_{\mathrm{act}}(A, A') \propto \frac{1}{B^2}\sum_{b,b'} k_{\mathrm{traj}}\big(a^{(b)}, a'^{(b')}\big).
-$$
-
-**`kern_cd_prod_pool`** (control) averages over $h$ as well,
-
-$$
-\mu_A = \frac{1}{BH}\sum_b \sum_h \varphi\big(a^{(b)}_h\big) \in \mathbb{R}^{d},
-\qquad
-k_{\mathrm{traj}}(x,y) = \sum_{h, h'} \exp\!\big(-\gamma_a\|x_h - y_{h'}\|^2\big),
-$$
-
-which compares every timestep against every other and is therefore blind to ordering within a
-chunk.
-
-Two remarks:
-
-- $k_{\mathrm{act}}$ is a normalised *linear* kernel on mean embeddings, not
-  $\exp(-\gamma\,\mathrm{MMD}^2)$, so the joint kernel is **not** an RBF on a concatenation and
-  cannot be obtained by concatenating blocks as in the variants above.
-- $\gamma_a \to 0 \Rightarrow k_{\mathrm{act}} \to 1$, recovering `kern_cd_rbf` exactly; the
-  method is a strict generalisation of that baseline.
+- $\lambda = 10^{-5}$, exact (not low-rank) kern_cd.
+- $128$ Random Fourier Features.
+- At most three bandwidths, each the median pairwise distance over the fit set, taken
+  **independently and in this order**: $\sigma_o$ on observation embeddings, then
+  $\sigma_\varphi$ on the parts (it lives inside $\varphi$, so it must be fixed before any
+  mean embedding exists), then $\sigma_A$ on the mean embeddings (which only exist once
+  $\varphi$ is drawn).
+- Tensors are used raw, at `configs/eval/base.yaml`'s normalisation defaults.

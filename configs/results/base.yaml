@@ -65,13 +65,11 @@ filter_values:
     - rnd_a
     - similarity
     - rnd_oe_and_entropy
-    - kern_cd_rbf
-    - kern_cd_poly
-    - kern_cd_rbf_disp
-    - kern_cd_rbf_sig
-    - kern_cd_rbf_sigk
-    - kern_cd_prod
-    - kern_cd_prod_pool
+    - kern_cd_obs
+    - kern_cd_disp
+    - kern_cd_sig
+    - kern_cd_flat
+    - kern_cd_sum
     # - rnd_oe_or_entropy
   Quantile: # Float values or "best" for the best value
     # - best
@@ -220,10 +218,8 @@ method_name_mapping:
   logpzo: "logpZO"
   rnd_oe_and_entropy: "FIPER"
   rnd_oe_or_entropy: "RND-OE or ACE"
-  kern_cd_rbf: "KernCD-RBF"
-  kern_cd_poly: "KernCD-Poly"
-  kern_cd_rbf_disp: "KernCD-Joint-Disp"
-  kern_cd_rbf_sig: "KernCD-Joint-Sig"
-  kern_cd_rbf_sigk: "KernCD-Joint-SigK"
-  kern_cd_prod: "KernCD-Product"
-  kern_cd_prod_pool: "KernCD-Product-Pooled"
+  kern_cd_obs: "KernCD-Obs"
+  kern_cd_disp: "KernCD-Disp"
+  kern_cd_sig: "KernCD-Sig"
+  kern_cd_flat: "KernCD-Flat"
+  kern_cd_sum: "KernCD-Sum"
