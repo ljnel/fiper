@@ -14,7 +14,7 @@ Setup
 A length-only logistic baseline is also reported: episode length is a strong
 leak, so the gripper AUROC should be read against it, not against 0.5.
 
-Run: pixi run python my_experiments/gripper_failure_logreg.py
+Run: pixi run python my_experiments/failure_eda/gripper_failure_logreg.py
 """
 import glob
 import pickle

@@ -1,12 +1,13 @@
 """Visual comparison: SPARC vs accel_rms as success/failure predictors
 on the stacking last-24 EE-position window."""
-import glob, numpy as np, importlib.util
+import glob, pathlib, numpy as np, importlib.util
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, roc_curve
 
-spec = importlib.util.spec_from_file_location("m", "my_experiments/ee_smoothness_clf.py")
+spec = importlib.util.spec_from_file_location(
+    "m", str(pathlib.Path(__file__).resolve().parent / "ee_smoothness_clf.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 
 fs = sorted(glob.glob("data/stacking/rollouts/test/*.pkl"))
@@ -47,6 +48,6 @@ ax[2].legend(frameon=False, loc="lower right")
 fig.suptitle("Stacking failure prediction from EE-position smoothness "
              "(last-24 window)", fontsize=13, y=1.02)
 fig.tight_layout()
-out = "my_experiments/sparc_vs_accel.png"
+out = str(pathlib.Path(__file__).resolve().parent / "sparc_vs_accel.png")
 fig.savefig(out, dpi=130, bbox_inches="tight")
 print("wrote", out)

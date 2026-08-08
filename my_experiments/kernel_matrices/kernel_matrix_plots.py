@@ -66,7 +66,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-ROOT_DIR = str(pathlib.Path(__file__).resolve().parent.parent)
+HERE = pathlib.Path(__file__).resolve().parent
+ROOT_DIR = str(HERE.parent.parent)
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 _SIG_DIR = os.path.join(ROOT_DIR, "my_experiments", "sig_study")
@@ -408,7 +409,7 @@ def main() -> None:
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--data-dir", default=os.path.join(ROOT_DIR, "data"))
     p.add_argument("--config-dir", default=os.path.join(ROOT_DIR, "configs"))
-    p.add_argument("--out-dir", default=os.path.join(ROOT_DIR, "outputs", "kernel_matrices"))
+    p.add_argument("--out-dir", default=str(HERE))
     args = p.parse_args()
 
     t0 = time.time()

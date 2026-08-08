@@ -7,9 +7,10 @@ Three panels:
   C) AUROC of a logistic regression on the first-20 vs last-20 gripper window,
      with episode length as a leak reference.
 
-Run: pixi run python my_experiments/plot_gripper_summary.py
+Run: pixi run python my_experiments/failure_eda/plot_gripper_summary.py
 """
 import glob
+import pathlib
 import pickle
 
 import numpy as np
@@ -103,6 +104,6 @@ ax[2].grid(axis="y", alpha=.3)
 fig.suptitle("Stacking: gripper width predicts failure only in the terminal phase  "
              "(N=800 test episodes, logistic regression, 80/20 holdout)", fontsize=13, weight="bold")
 plt.tight_layout(rect=[0, 0, 1, 0.96])
-out = "/home/louis/fiper/my_experiments/gripper_failure_summary.png"
+out = str(pathlib.Path(__file__).resolve().parent / "gripper_failure_summary.png")
 plt.savefig(out, dpi=140)
 print("saved", out, "| AUROC first/last/len:", round(a_first, 3), round(a_last, 3), round(a_len, 3))

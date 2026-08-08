@@ -11,7 +11,7 @@ Features per episode:
   - 6 pairwise block-to-block distances
   - 4 distances from each block to the scene centroid (spread)
 
-Run:  pixi run python my_experiments/predict_failure_from_centroids.py
+Run:  pixi run python my_experiments/failure_eda/predict_failure_from_centroids.py
 """
 import itertools
 import os
@@ -20,7 +20,7 @@ import numpy as np
 from matplotlib.colors import rgb_to_hsv
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CACHE = os.path.join(HERE, "_initial_frames_cache.npz")
+CACHE = os.path.join(HERE, "cache", "_initial_frames_cache.npz")
 SEED = 0
 COLORS = ["red", "blue", "green", "cyan"]
 

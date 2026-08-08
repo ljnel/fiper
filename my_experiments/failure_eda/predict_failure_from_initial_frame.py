@@ -14,7 +14,7 @@ Pipeline:
   3. Compare: majority-class baseline, logistic regression on pixels,
      and a small CNN.  Report acc / balanced-acc / ROC-AUC / confusion matrix.
 
-Run:  pixi run python my_experiments/predict_failure_from_initial_frame.py
+Run:  pixi run python my_experiments/failure_eda/predict_failure_from_initial_frame.py
 """
 
 from __future__ import annotations
@@ -25,9 +25,10 @@ import pickle
 
 import numpy as np
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
 TEST_DIR = os.path.join(ROOT, "data", "stacking", "rollouts", "test")
-CACHE = os.path.join(os.path.dirname(__file__), "_initial_frames_cache.npz")
+CACHE = os.path.join(HERE, "cache", "_initial_frames_cache.npz")
 SEED = 0
 
 
@@ -55,6 +56,7 @@ def load_dataset():
             print(f"  loaded {i + 1}/{len(files)}")
     X = np.stack(X).astype(np.uint8)
     y = np.array(y, dtype=np.int64)
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
     np.savez_compressed(CACHE, X=X, y=y)
     print(f"cached {CACHE}  X={X.shape}  failures={y.sum()}/{len(y)}")
     return X, y

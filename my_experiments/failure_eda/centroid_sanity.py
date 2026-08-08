@@ -3,8 +3,8 @@ the main predict_failure script). Saves a grid of overhead frames with the
 estimated red/blue/green/cyan centroids marked, so the segmentation can be
 eyeballed before we trust it as features.
 
-Run:  pixi run python my_experiments/centroid_sanity.py
-Out:  my_experiments/centroid_sanity.png
+Run:  pixi run python my_experiments/failure_eda/centroid_sanity.py
+Out:  my_experiments/failure_eda/centroid_sanity.png
 """
 import os
 
@@ -15,7 +15,7 @@ import numpy as np
 from matplotlib.colors import rgb_to_hsv
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CACHE = os.path.join(HERE, "_initial_frames_cache.npz")
+CACHE = os.path.join(HERE, "cache", "_initial_frames_cache.npz")
 OUT = os.path.join(HERE, "centroid_sanity.png")
 SCATTER_OUT = os.path.join(HERE, "centroid_scatter.png")
 
