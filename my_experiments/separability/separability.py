@@ -1,62 +1,55 @@
-"""How separable are FIPER's test episodes from its nominal data? -- ``specs/experiments/separability.md``.
+"""How separable is FIPER's data at all? -- ``specs/experiments/separability.md``.
 
-The question
-------------
-Our kern_cd family (``specs/methods.md``) barely moves the FIPER numbers. That is either a
-weakness of the methods or a property of the benchmark. This script measures the second:
-it hands a classifier the success/failure labels that the benchmark withholds, and asks how
-well an *oracle* two-sample test can tell FIPER's nominal (calibration) data from its test
-episodes. FIPER itself is the one-class version of exactly this problem, so a supervised
-AUROC near chance is a ceiling on what any one-class method could achieve.
+An oracle two-sample test given the labels FIPER withholds. Calibration is the "nominal"
+class; the test split is cut by its own success label into two positive classes, each
+compared against nominal on its own:
 
-Two comparisons per task, both against the same nominal pool:
+    (Q1)  nominal vs test *success*      (Q2)  nominal vs test *failure*
 
-* nominal vs **test success** episodes (green) -- the distribution shift the benchmark does
-  *not* want flagged (policy rollouts that worked, drawn from a later/held-out pass).
-* nominal vs **test failure** episodes (red) -- the shift it *does* want flagged.
+A random forest scored by AUROC under 5-fold CV **over episodes** -- never over steps, since
+consecutive steps of one rollout are near-duplicates and would leak. Figure 1 plots the
+pooled out-of-fold AUROC per comparison. The success curve is the control: it absorbs any
+calibration-vs-test shift unrelated to failing, so the meaningful quantity is the gap,
+failure AUROC minus success AUROC.
 
-The gap between the two lines is the signal available to a failure detector. Where the lines
-sit on top of each other, no score computed from observation embeddings can separate failure
-from success, however it is calibrated -- and where both sit near 1.0, the classifier is
-picking up a nominal-vs-test shift that has nothing to do with failure.
+At grid time ``t`` the model trains on the prefix pool of every step with normalized
+position ``u = i/(T-1) <= t``. Episode length is a strong success/failure confound but
+cannot leak, because a pooled step carries no information about its episode's length.
 
-Design
-------
-* **Features**: observation embeddings only, raw (``configs/eval/base.yaml`` sets
-  ``normalize_tensors.obs_embeddings: False``, and ``specs/methods.md`` keeps that default).
-* **Time axis**: normalized time ``tau = (i+1)/T`` within an episode. At each grid point
-  ``t`` the model trains on the *pool of all steps with ``tau <= t``* -- steps, not episodes,
-  so that the strong episode-length confound (failures run ~2x longer) cannot leak in
-  through the label. ``--binned`` switches the pool to just the steps inside ``(t-dt, t]``,
-  which trades sample size for a sharper read on where the two curves diverge.
-* **Score**: AUROC of a random forest, cross-validated **over episodes**
-  (``StratifiedGroupKFold`` on the episode id), so no fold ever scores a step whose
-  near-duplicate neighbours it was trained on. The plotted value is the AUROC of the pooled
-  out-of-fold probabilities; the band is +/-1 std of the per-fold AUROCs.
-* **Balance**: at each ``(task, t)`` all pools -- nominal, success, failure -- are subsampled
-  to one common size, so the green and red numbers are computed at the same n and the same
-  50/50 class balance and are directly comparable to each other and across time.
+Q3 asks whether the action channels help, which is a change in the *gap*, not in the failure
+AUROC alone. Figure 2 therefore plots one number per grid point, the difference-in-
+differences ``(fail - succ | obs+act) - (fail - succ | obs)``, formed inside each fold and
+then averaged, with a 95% Student-t CI on the DiD itself -- see :func:`did_curve`. The two
+feature sets are:
 
-Push T's calibration split contains 29 failed rollouts out of 50 and they are kept here (the
-spec says to ignore that contamination); the printed report quotes the count so its effect on
-push_t can be judged.
+* ``obs``     -- the observation embedding, ``[d_obs]``. All five tasks.
+* ``obs+act`` -- that, concatenated with the flattened task-space (position, D=3) chunk
+  batch, ``[d_obs + B*H*3]``. Restricted per the spec to the three tasks with a small chunk
+  batch (sorting/stacking B=32, pretzel B=30); B=256 on push_t and push_chair would put
+  12288 action features against 64 observation ones.
 
-Cost
-----
-Observation embeddings only, so no action tensors are built and the whole dataset for the
-biggest task loads in ~3 s. The pools are capped at ``--max-per-class`` steps, which bounds
-every forest fit regardless of task size.
+Both are scored in the same run on the same subsampled steps and the same folds, so an
+AUROC difference between them is the features and nothing else. Neither block is scaled: a
+forest splits one feature at a time, so it is invariant to per-feature rescaling.
+
+Two things to know when reading figure 1. The success curve falls *below* 0.5 on stacking and
+push_chair -- reproducibly, at a per-fold std of 0.03 over 4000-row pools. Sub-chance AUROC
+under grouped CV means the nominal class is more heterogeneous episode-to-episode than it is
+different from test successes, so a held-out nominal episode lands where no *training*
+nominal episode did and gets called "test" more confidently than the held-out test episodes
+do. Read it as "no separation that survives an unseen episode". And push_t's calibration
+split is 29/50 failed rollouts, so its nominal class is contaminated; the spec says to accept
+that, but it is why push_t is the least interpretable of the five.
 
 Running it
 ----------
-    python my_experiments/separability/separability.py                 # all 5 tasks -> separability.{png,pdf}
-    python my_experiments/separability/separability.py --tasks push_t  # one task
-    python my_experiments/separability/separability.py --binned        # per-bin pools instead of cumulative
-    python my_experiments/separability/separability.py --null-control  # + nominal-vs-nominal chance check
-    python my_experiments/separability/separability.py --plot-only     # redraw from the cache
+    pixi run python my_experiments/separability/separability.py             # everything
+    pixi run python my_experiments/separability/separability.py --tasks pretzel push_chair
+    pixi run python my_experiments/separability/separability.py --force     # ignore the cache
+    pixi run python my_experiments/separability/separability.py --plot-only # just redraw
 
-Per-task grids are cached as CSVs under ``my_experiments/separability/cache/`` and reused;
-``--force`` re-runs. Nothing outside ``my_experiments/`` is written.
+Per-task scores are cached under ``cache/`` and reused; the figures are written next to this
+file as png and pdf. Nothing under ``data/`` is touched.
 """
 
 from __future__ import annotations
@@ -65,7 +58,6 @@ import argparse
 import os
 import pathlib
 import sys
-import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT_DIR = str(HERE.parent.parent)
@@ -80,442 +72,652 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+from scipy.stats import t as student_t  # noqa: E402
 from sklearn.ensemble import RandomForestClassifier  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
-from sklearn.model_selection import StratifiedGroupKFold  # noqa: E402
 
-from my_methods.run import ALL_TASKS  # noqa: E402
-from shared_utils.hydra_utils import load_config  # noqa: E402
-from tasks import TaskManager  # noqa: E402
+from datasets.rollout_datasets import ProcessedRolloutDataset  # noqa: E402
 
-CACHE_DIR = HERE / "cache"
-OUT_STEM = HERE / "separability"
+#: Plot / report order, matching ``my_methods.run.ALL_TASKS``.
+TASKS = ["push_t", "pretzel", "push_chair", "sorting", "stacking"]
 
-#: The two comparisons, in plot order. Key -> (label, colour, linestyle, marker).
-#: Green/red is the spec's choice and is a status encoding (success/failure), but the pair
-#: sits in the 6-8 CVD floor band, so identity is carried a second time by the line style
-#: and the marker as well as by the legend.
-SERIES = {
-    "success": ("test success vs nominal", "#116329", "-", "o"),
-    "failure": ("test failure vs nominal", "#e5484d", "--", "^"),
+#: Tasks whose action chunk batch is small enough to concatenate (B <= 32, per the spec).
+ACTION_TASKS = ["sorting", "stacking", "pretzel"]
+
+TASK_LABELS = {
+    "push_t": "Push T",
+    "pretzel": "Pretzel",
+    "push_chair": "Push Chair",
+    "sorting": "Sorting",
+    "stacking": "Stacking",
 }
 
-#: Below this many steps per class the AUROC is noise, so it is reported as NaN and left
-#: out of the line rather than drawn as a wild excursion. push_chair (3-7 step episodes,
-#: 49 nominal steps in total) is the task this exists for.
-MIN_PER_CLASS = 25
+#: The two positive classes, each compared against "nominal" (= calibration) on its own.
+COMPARISONS = {"success": "test success vs nominal", "failure": "test failure vs nominal"}
+
+FEATURE_SETS = ["obs", "obs+act"]
+
+CACHE_DIR = HERE / "cache"
+
+#: Normalized times at which the prefix pool is cut.
+TIME_GRID = np.round(np.arange(0.1, 1.0001, 0.1), 3)
+
+#: Cap on pooled steps per class per grid point. Pools reach 48500 steps (stacking failures
+#: at t=1), where another thousand near-duplicate steps no longer moves an AUROC.
+MAX_STEPS_PER_CLASS = 2000
+
+N_FOLDS = 5
+N_TREES = 200
+
+#: Below this many pooled steps (both classes together) an AUROC is not worth reporting.
+MIN_ROWS = 20
+
+#: What a grid point that could not be scored at all contributes.
+EMPTY_SCORE = {"auroc": np.nan, "fold_mean": np.nan, "fold_std": np.nan,
+               "n_folds_scored": 0, "fold_aurocs": ""}
 
 
 # --------------------------------------------------------------------------------- data
-def load_task(task: str):
-    """Raw observation embeddings + the episode index for one task.
+def load_task(task: str, with_actions: bool) -> ProcessedRolloutDataset:
+    """The processed rollout cache for ``task``, read-only.
 
-    Returns ``(X, starts, ends, calib_mask, test_mask, success_mask)`` where ``X`` is the
-    ``[N_steps, d_obs]`` float32 matrix of every step in the task, in dataset order, and the
-    masks are per *episode*. Reading ``ds.data`` directly rather than going through
-    ``get_subset`` keeps the row indices global, which is what the pooling below needs.
+    ``action_preds`` is requested only where used -- 1.4 GB on stacking, 512 MB on push_t.
     """
-    cfg = load_config("task", task, return_only_subdict=False)
-    manager = TaskManager(
-        cfg,
-        task,
-        os.path.join(ROOT_DIR, "configs"),
-        os.path.join(ROOT_DIR, "data", task),
-        required_tensors=["obs_embeddings"],
-        optional_tensors=[],
-        device="cpu",
+    tensors = ["obs_embeddings"] + (["action_preds"] if with_actions else [])
+    ds = ProcessedRolloutDataset(
+        task_data_path=os.path.join("data", task),
+        base_config_path="configs",
+        required_tensors=tensors,
     )
-    # load_dataset_if_exists=False for the reason given in my_methods/run.py: the cached
-    # processed_rollouts/*.pt load path is broken upstream. Re-converting is ~0.1-4 s here,
-    # since obs_embeddings is the only tensor requested.
-    ds = manager.get_rollout_dataset(load_dataset_if_exists=False)
-    md = ds.data["metadata"]
-    X = np.asarray(ds.data["obs_embeddings"], dtype=np.float32)
-    return (
-        X,
-        np.asarray(md["episode_start_indices"], dtype=int),
-        np.asarray(md["episode_end_indices"], dtype=int),
-        np.asarray(md["calibration_rollout_labels"], dtype=bool),
-        np.asarray(md["test_rollout_labels"], dtype=bool),
-        np.asarray(md["successful_rollout_labels"], dtype=bool),
-    )
+    ds.load_dataset()
+    assert ds.dataset_loaded, f"no processed rollout cache for task '{task}'"
+    # load_dataset() keys tensors as "<name>.pt" (same fix as sig_study/loader.py).
+    for k in list(ds.data.keys()):
+        if k.endswith(".pt"):
+            ds.data[k[:-3]] = ds.data.pop(k)
+    return ds
 
 
-def step_table(starts: np.ndarray, ends: np.ndarray, keep: np.ndarray) -> dict:
-    """Flatten the episodes selected by ``keep`` into a per-step table.
+def build_classes(ds: ProcessedRolloutDataset) -> dict[str, dict]:
+    """The three step pools: ``nominal``, ``success``, ``failure``.
 
-    Returns ``{"row", "ep", "tau", "lengths", "ep_ids"}``: the global row index of each step,
-    the episode it belongs to (the CV group), its normalized time ``(i+1)/T``, and the
-    episode lengths. One entry per step, in dataset order.
+    Each holds parallel per-step arrays: the flat step index, the episode id (offset per
+    pool so it is unique and usable as a CV group), and normalized position ``u``.
     """
-    ep_ids = np.where(keep)[0]
-    rows, eps, taus, lengths = [], [], [], []
-    for e in ep_ids:
-        s, f = int(starts[e]), int(ends[e])
-        n = f - s
-        if n <= 0:
+    out = {}
+    for offset, (name, subset, want) in enumerate(
+        (("nominal", "calibration", None), ("success", "test", True), ("failure", "test", False))
+    ):
+        starts, ends, labels = ds._filter_start_end_episode_indices(subset=subset)
+        labels = np.asarray(labels).astype(bool)
+        chosen = np.arange(len(starts)) if want is None else np.flatnonzero(labels == want)
+
+        step, ep, u = [], [], []
+        for e in chosen:
+            s, t = int(starts[e]), int(ends[e])
+            T = t - s
+            step.append(np.arange(s, t))
+            ep.append(np.full(T, offset * 100_000 + int(e)))
+            u.append(np.zeros(T) if T == 1 else np.arange(T) / (T - 1))
+        out[name] = {
+            "step": np.concatenate(step),
+            "ep": np.concatenate(ep),
+            "u": np.concatenate(u),
+            "n_ep": len(chosen),
+            "lengths": (ends - starts)[chosen].astype(int),
+        }
+    return out
+
+
+def gather(ds: ProcessedRolloutDataset, steps: np.ndarray, action_slice) -> tuple[np.ndarray, np.ndarray | None]:
+    """``(obs [n, d_obs], act [n, B*H*3] or None)`` for the given flat step indices."""
+    obs = np.asarray(ds.data["obs_embeddings"][steps], dtype=np.float32)
+    if obs.ndim > 2:  # history_length > 1 would add an axis; keep the current step
+        obs = obs[:, 0]
+    if action_slice is None:
+        return obs, None
+    ap = ds.data["action_preds"][steps]
+    if ap.ndim == 5:  # [n, robots, B, H, A]
+        assert ap.shape[1] == 1, "multi-robot rollouts are not supported"
+        ap = ap[:, 0]
+    act = np.asarray(ap[..., action_slice], dtype=np.float32).reshape(len(steps), -1)
+    return obs, act
+
+
+# ------------------------------------------------------------------------------ sampling
+def select_prefix(u: np.ndarray, prio: np.ndarray, t: float, cap: int) -> np.ndarray:
+    """Row positions of the prefix pool ``u <= t``, subsampled to ``cap`` by ``prio``.
+
+    Keeping the ``cap`` smallest priorities is a uniform draw (``prio`` is iid uniform) and
+    stable across ``t``: the pools are nested, so neighbouring grid points share most rows
+    instead of each re-drawing its own sample.
+    """
+    pool = np.flatnonzero(u <= t + 1e-12)
+    if len(pool) > cap:
+        pool = pool[np.argsort(prio[pool], kind="stable")[:cap]]
+    return np.sort(pool)
+
+
+def assign_folds(ep: np.ndarray, n_folds: int, rng: np.random.Generator) -> dict[int, int]:
+    """``episode id -> fold``, round-robin over a shuffled episode list.
+
+    Assigned per class once per task, before any grid point runs, so every ``t`` and both
+    feature sets see the identical partition.
+    """
+    eps = np.unique(ep)
+    rng.shuffle(eps)
+    return {int(e): i % n_folds for i, e in enumerate(eps)}
+
+
+# -------------------------------------------------------------------------------- scoring
+def cv_auroc(X: np.ndarray, y: np.ndarray, fold: np.ndarray, n_folds: int, seed: int) -> dict:
+    """Pooled out-of-fold AUROC of a random forest, plus the per-fold spread.
+
+    A fold whose held-out part is single-class still contributes its predictions to the
+    pooled ``auroc``; only its own per-fold AUROC is undefined.
+
+    ``fold_aurocs`` keeps the per-fold numbers **indexed by fold id**, NaN where unscored.
+    :func:`did_curve` needs that: all four AUROCs entering one DiD must come from the same
+    fold, and a positional list would misalign the moment one of them dropped a fold.
+    """
+    oof_y, oof_p = [], []
+    per_fold = np.full(n_folds, np.nan)
+    for f in range(n_folds):
+        test = fold == f
+        train = ~test
+        if not test.any() or len(np.unique(y[train])) < 2:
             continue
-        rows.append(np.arange(s, f))
-        eps.append(np.full(n, e))
-        taus.append((np.arange(n) + 1) / n)
-        lengths.append(n)
-    if not rows:
-        return {"row": np.zeros(0, int), "ep": np.zeros(0, int), "tau": np.zeros(0),
-                "lengths": np.zeros(0, int), "ep_ids": ep_ids}
-    return {
-        "row": np.concatenate(rows),
-        "ep": np.concatenate(eps),
-        "tau": np.concatenate(taus),
-        "lengths": np.asarray(lengths, dtype=int),
-        "ep_ids": ep_ids,
-    }
-
-
-def pool_mask(tab: dict, t: float, dt: float, binned: bool) -> np.ndarray:
-    """Steps of ``tab`` that belong to the pool at normalized time ``t``."""
-    if binned:
-        return (tab["tau"] > t - dt) & (tab["tau"] <= t + 1e-12)
-    return tab["tau"] <= t + 1e-12
-
-
-# ---------------------------------------------------------------------------- the score
-def cv_auroc(X: np.ndarray, y: np.ndarray, groups: np.ndarray, folds: int, trees: int,
-             seed: int) -> tuple[float, float, float, int]:
-    """Grouped-CV AUROC of a random forest.
-
-    Returns ``(auroc_oof, fold_mean, fold_std, n_splits)``. ``auroc_oof`` -- the AUROC of the
-    concatenated out-of-fold probabilities -- is the plotted number; it uses every point once
-    and does not degenerate when a fold happens to hold few episodes. The per-fold spread is
-    kept for the uncertainty band.
-
-    The split is ``StratifiedGroupKFold`` over episode ids: consecutive steps of one episode
-    are near-duplicates, so a step-level split would let the model memorise a neighbour of
-    every test point and report a separability that is not there.
-    """
-    n_splits = int(min(folds, np.unique(groups[y == 0]).size, np.unique(groups[y == 1]).size))
-    if n_splits < 2:
-        return np.nan, np.nan, np.nan, n_splits
-
-    oof = np.full(len(y), np.nan)
-    per_fold = []
-    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    for k, (tr, te) in enumerate(splitter.split(X, y, groups)):
         clf = RandomForestClassifier(
-            n_estimators=trees,
-            n_jobs=-1,
-            random_state=seed + k,
-            class_weight="balanced",
+            n_estimators=N_TREES, n_jobs=-1, random_state=seed, class_weight="balanced"
         )
-        clf.fit(X[tr], y[tr])
-        oof[te] = clf.predict_proba(X[te])[:, 1]
-        if np.unique(y[te]).size == 2:
-            per_fold.append(roc_auc_score(y[te], oof[te]))
+        clf.fit(X[train], y[train])
+        p = clf.predict_proba(X[test])[:, 1]
+        oof_y.append(y[test])
+        oof_p.append(p)
+        if len(np.unique(y[test])) == 2:
+            per_fold[f] = roc_auc_score(y[test], p)
 
-    auroc = roc_auc_score(y, oof) if np.unique(y).size == 2 else np.nan
-    fold_mean = float(np.mean(per_fold)) if per_fold else np.nan
-    fold_std = float(np.std(per_fold)) if len(per_fold) > 1 else np.nan
-    return float(auroc), fold_mean, fold_std, n_splits
-
-
-def balanced_draw(tabs: list[dict], masks: list[np.ndarray], cap: int,
-                  rng: np.random.Generator) -> tuple[list[np.ndarray], int]:
-    """Subsample every pool to one common size, drawing steps (not whole episodes).
-
-    A common ``n`` across the nominal, success and failure pools is what makes the two
-    AUROCs comparable: same sample size, same 50/50 balance, so a difference between the
-    green and the red curve cannot be an artefact of one pool being larger. Steps are drawn
-    individually so the surviving sample still spans as many episodes as possible, which the
-    grouped CV needs.
-    """
-    n = min(cap, *[int(m.sum()) for m in masks])
-    out = []
-    for tab, mask in zip(tabs, masks):
-        idx = np.where(mask)[0]
-        if len(idx) > n:
-            idx = rng.choice(idx, n, replace=False)
-        out.append(idx)
-    return out, n
-
-
-def two_sample(X: np.ndarray, a_tab: dict, a_idx: np.ndarray, b_tab: dict, b_idx: np.ndarray,
-               folds: int, trees: int, seed: int) -> dict:
-    """One grouped-CV AUROC for pool ``a`` (class 0) against pool ``b`` (class 1)."""
-    rows = np.concatenate([a_tab["row"][a_idx], b_tab["row"][b_idx]])
-    groups = np.concatenate([a_tab["ep"][a_idx], b_tab["ep"][b_idx]])
-    y = np.concatenate([np.zeros(len(a_idx), int), np.ones(len(b_idx), int)])
-    auroc, fold_mean, fold_std, n_splits = cv_auroc(X[rows], y, groups, folds, trees, seed)
+    if not oof_y:
+        return EMPTY_SCORE
+    yy, pp = np.concatenate(oof_y), np.concatenate(oof_p)
+    scored = per_fold[np.isfinite(per_fold)]
     return {
-        "auroc": auroc,
-        "fold_mean": fold_mean,
-        "fold_std": fold_std,
-        "n_splits": n_splits,
-        "n_per_class": len(a_idx),
-        "n_ep_0": int(np.unique(groups[y == 0]).size),
-        "n_ep_1": int(np.unique(groups[y == 1]).size),
+        "auroc": roc_auc_score(yy, pp) if len(np.unique(yy)) == 2 else np.nan,
+        "fold_mean": float(scored.mean()) if len(scored) else np.nan,
+        "fold_std": float(scored.std()) if len(scored) else np.nan,
+        "n_folds_scored": len(scored),
+        "fold_aurocs": ";".join("nan" if not np.isfinite(v) else f"{v:.6f}" for v in per_fold),
     }
 
 
-# ----------------------------------------------------------------------------- the sweep
-def run_task(task: str, args) -> pd.DataFrame:
-    """The full (time x comparison) AUROC grid for one task, with the shape report."""
-    t0 = time.time()
-    X, starts, ends, calib, test, success = load_task(task)
-    tabs = {
-        "nominal": step_table(starts, ends, calib),
-        "success": step_table(starts, ends, test & success),
-        "failure": step_table(starts, ends, test & ~success),
-    }
-    report_task(task, X, tabs, calib, success, time.time() - t0)
+def run_task(task: str, seed: int) -> pd.DataFrame:
+    """The full (feature set x comparison x t) grid for one task, with a shape report."""
+    with_actions = task in ACTION_TASKS
+    ds = load_task(task, with_actions)
+    classes = build_classes(ds)
 
-    grid = np.round(np.linspace(1.0 / args.grid, 1.0, args.grid), 6)
-    dt = 1.0 / args.grid
-    rng = np.random.default_rng(args.seed)
+    obs_shape = tuple(ds.data["obs_embeddings"].shape)
+    d_obs = int(obs_shape[-1])
+    B, H = chunk_shape(ds)
+    if with_actions:
+        action_slice = ds._get_action_slices(required_actions=["position"], optional_actions=[])
+        ap_shape = tuple(ds.data["action_preds"].shape)
+        d_act = B * H * len(action_slice)
+    else:
+        action_slice, ap_shape, d_act = None, None, 0
+
+    print(f"\n{'=' * 88}\n=== {TASK_LABELS[task]} ({task})\n{'=' * 88}")
+    print(f"  obs_embeddings tensor        {obs_shape}    d_obs = {d_obs}")
+    if with_actions:
+        print(f"  action_preds tensor          {ap_shape}    B = {B}, H = {H}, A = {ap_shape[-1]}")
+        print(f"  position channels kept       {list(map(int, action_slice))}  ->  "
+              f"d_act = B*H*D = {B}*{H}*{len(action_slice)} = {d_act}")
+    else:
+        print(f"  action_preds                 not loaded (B = {B} > 32: excluded from Q3 by the spec)")
+
+    print("\n  --- step pools (whole episodes, before any prefix cut) ---")
+    for name, c in classes.items():
+        L = c["lengths"]
+        print(f"  {name:<8} {c['n_ep']:>4} episodes  {len(c['step']):>6} steps   "
+              f"episode length min/median/max = {L.min()}/{int(np.median(L))}/{L.max()}")
+    if task == "push_t":
+        starts, ends, labels = ds._filter_start_end_episode_indices(subset="calibration")
+        n_fail = int((~np.asarray(labels).astype(bool)).sum())
+        print(f"  NB: {n_fail}/{len(labels)} calibration episodes of push_t are failures, so "
+              "'nominal' is contaminated (accepted, per the spec).")
+
+    rng = np.random.default_rng(seed)
+    prio = {name: rng.random(len(c["step"])) for name, c in classes.items()}
+    fold_of = {name: assign_folds(c["ep"], N_FOLDS, rng) for name, c in classes.items()}
+
+    # Resolve every row set the grid needs before gathering, so the union is read out of
+    # the big tensors in one pass.
+    plan = {}
+    for comp in COMPARISONS:
+        n_folds = min(N_FOLDS, classes["nominal"]["n_ep"], classes[comp]["n_ep"])
+        for t in TIME_GRID:
+            a = select_prefix(classes["nominal"]["u"], prio["nominal"], t, MAX_STEPS_PER_CLASS)
+            b = select_prefix(classes[comp]["u"], prio[comp], t, MAX_STEPS_PER_CLASS)
+            plan[(comp, float(t))] = {
+                "rows_nom": a,
+                "rows_pos": b,
+                "n_folds": n_folds,
+                "pool_nom": int((classes["nominal"]["u"] <= t + 1e-12).sum()),
+                "pool_pos": int((classes[comp]["u"] <= t + 1e-12).sum()),
+            }
+
+    needed = np.unique(
+        np.concatenate(
+            [classes["nominal"]["step"][p["rows_nom"]] for p in plan.values()]
+            + [classes[comp]["step"][p["rows_pos"]] for (comp, _), p in plan.items()]
+        )
+    )
+    obs_u, act_u = gather(ds, needed, action_slice)
+    print(f"\n  --- features gathered once for the {len(needed)} distinct steps the grid touches ---")
+    print(f"  obs block   {obs_u.shape}  mean {obs_u.mean():+.4g}  std {obs_u.std():.4g}  "
+          f"min {obs_u.min():+.4g}  max {obs_u.max():+.4g}")
+    if act_u is not None:
+        print(f"  act block   {act_u.shape}  mean {act_u.mean():+.4g}  std {act_u.std():.4g}  "
+              f"min {act_u.min():+.4g}  max {act_u.max():+.4g}")
+    def to_rows(steps: np.ndarray) -> np.ndarray:
+        pos = np.searchsorted(needed, steps)
+        assert np.array_equal(needed[pos], steps), "a required step is missing from the gathered block"
+        return pos
+
+    feature_sets = FEATURE_SETS if with_actions else ["obs"]
+    print(f"\n  --- {len(feature_sets)} feature set(s) x {len(COMPARISONS)} comparisons x "
+          f"{len(TIME_GRID)} grid points, {N_FOLDS}-fold CV over episodes ---")
 
     rows = []
-    for t in grid:
-        masks = {k: pool_mask(tab, float(t), dt, args.binned) for k, tab in tabs.items()}
-        (i_nom, i_suc, i_fail), n = balanced_draw(
-            [tabs["nominal"], tabs["success"], tabs["failure"]],
-            [masks["nominal"], masks["success"], masks["failure"]],
-            args.max_per_class,
-            rng,
-        )
-        for key, idx in (("success", i_suc), ("failure", i_fail)):
-            row = {"Task": task, "t": float(t), "comparison": key,
-                   "n_pool_nominal": int(masks["nominal"].sum()),
-                   "n_pool_other": int(masks[key].sum())}
-            if n < MIN_PER_CLASS:
-                row.update(auroc=np.nan, fold_mean=np.nan, fold_std=np.nan, n_splits=0,
-                           n_per_class=n, n_ep_0=0, n_ep_1=0)
-            else:
-                row.update(two_sample(X, tabs["nominal"], i_nom, tabs[key], idx,
-                                      args.folds, args.trees, args.seed))
-            rows.append(row)
+    for comp in COMPARISONS:
+        print(f"\n  [{COMPARISONS[comp]}]")
+        print(f"  {'t':>5} {'pool_nom':>9} {'pool_pos':>9} {'n_nom':>6} {'n_pos':>6} {'X shape':>16} "
+              f"{'fold sizes':>22} {'AUROC':>7} {'fold mean+-std':>16}")
+        for t in TIME_GRID:
+            p = plan[(comp, float(t))]
+            r_nom, r_pos = p["rows_nom"], p["rows_pos"]
 
-        if args.null_control:
-            rows.append(null_control(task, float(t), X, tabs["nominal"], i_nom, args))
+            steps = np.concatenate([classes["nominal"]["step"][r_nom], classes[comp]["step"][r_pos]])
+            eps = np.concatenate([classes["nominal"]["ep"][r_nom], classes[comp]["ep"][r_pos]])
+            y = np.concatenate([np.zeros(len(r_nom)), np.ones(len(r_pos))])
+            fold = np.array([fold_of["nominal" if e < 100_000 else comp][int(e)] for e in eps])
+            pos = to_rows(steps)
+            assert len(pos) == len(y) == len(fold) == len(eps)
+            # No episode may straddle a fold boundary; that is the point of grouping by it.
+            assert all(len(set(fold[eps == e])) == 1 for e in np.unique(eps))
 
-    df = pd.DataFrame(rows)
-    report_grid(task, df)
-    return df
+            fold_sizes = [int((fold == f).sum()) for f in range(p["n_folds"])]
+            for fs in feature_sets:
+                X = obs_u[pos] if fs == "obs" else np.concatenate([obs_u[pos], act_u[pos]], axis=1)
+                if len(y) < MIN_ROWS or len(np.unique(y)) < 2:
+                    res = dict(EMPTY_SCORE)
+                else:
+                    res = cv_auroc(X, y, fold, p["n_folds"], seed)
+                rows.append({
+                    "task": task, "features": fs, "comparison": comp, "t": float(t),
+                    "n_ep_nominal": classes["nominal"]["n_ep"], "n_ep_pos": classes[comp]["n_ep"],
+                    "pool_nominal": p["pool_nom"], "pool_pos": p["pool_pos"],
+                    "n_nominal": len(r_nom), "n_pos": len(r_pos),
+                    "n_rows": len(y), "d": int(X.shape[1]),
+                    "B": B, "H": H, "d_obs": d_obs, "d_act": d_act,
+                    "n_folds": p["n_folds"], **res,
+                })
+                tag = "" if fs == "obs" else "  (+act)"
+                print(f"  {t:>5.1f} {p['pool_nom']:>9} {p['pool_pos']:>9} {len(r_nom):>6} {len(r_pos):>6} "
+                      f"{str(X.shape):>16} {str(fold_sizes):>22} {res['auroc']:>7.3f} "
+                      f"{res['fold_mean']:>7.3f}+-{res['fold_std']:<6.3f}{tag}")
+
+    return pd.DataFrame(rows)
 
 
-def null_control(task: str, t: float, X: np.ndarray, tab: dict, idx: np.ndarray, args) -> dict:
-    """Nominal against nominal: the same pipeline where the answer must be chance.
+def chunk_shape(ds: ProcessedRolloutDataset) -> tuple[int, int]:
+    """``(B, H)`` of a step's action chunk batch.
 
-    The nominal episodes are split in half *by episode* and relabelled. Anything the grouped
-    CV reports above 0.5 here is pipeline bias (fold imbalance, forest overfitting a small
-    pool), and is the level against which the two real curves should be read.
+    The loaded tensor is authoritative; where it was not loaded, fall back to the metadata,
+    which ``load_dataset`` always reads. ``action_pred_shape`` is an *unresolved* OmegaConf
+    interpolation on sorting and stacking, hence the digit check -- though both are action
+    tasks and never reach that branch.
     """
-    eps = np.unique(tab["ep"][idx])
-    rng = np.random.default_rng(args.seed + 1)
-    left = rng.choice(eps, len(eps) // 2, replace=False) if len(eps) > 1 else eps
-    is_left = np.isin(tab["ep"][idx], left)
-    a, b = idx[is_left], idx[~is_left]
-    n = min(len(a), len(b))
-    row = {"Task": task, "t": t, "comparison": "null_ctrl", "n_pool_nominal": len(a),
-           "n_pool_other": len(b)}
-    if n < MIN_PER_CLASS:
-        row.update(auroc=np.nan, fold_mean=np.nan, fold_std=np.nan, n_splits=0,
-                   n_per_class=n, n_ep_0=0, n_ep_1=0)
-    else:
-        row.update(two_sample(X, tab, a[:n], tab, b[:n], args.folds, args.trees, args.seed))
-    return row
+    if "action_preds" in ds.data:
+        shape = tuple(ds.data["action_preds"].shape)
+        return int(shape[-3]), int(shape[-2])
+    actions = ds.data["metadata"]["actions"]
+    head = str(actions["action_pred_shape"]).strip("() ").split(",")[0].strip()
+    assert head.isdigit(), f"cannot read B from action_pred_shape {actions['action_pred_shape']!r}"
+    return int(head), int(actions["action_prediction_horizon"])
 
 
-# --------------------------------------------------------------------------- the reports
-def report_task(task: str, X: np.ndarray, tabs: dict, calib: np.ndarray, success: np.ndarray,
-                load_s: float) -> None:
-    """Shapes and summary stats of everything the sweep reads."""
-    print(f"\n{'=' * 78}\n=== {task}  (dataset built in {load_s:.1f} s)\n{'=' * 78}")
-    print(f"  obs_embeddings X                 {X.shape}  {X.dtype}   "
-          f"(raw: eval/base.yaml sets normalize_tensors.obs_embeddings=False)")
-    print(f"    per-element   mean {X.mean():+.4f}  std {X.std():.4f}  "
-          f"min {X.min():+.4f}  max {X.max():+.4f}")
-    norms = np.linalg.norm(X, axis=1)
-    print(f"    row L2 norm   mean {norms.mean():.4f}  std {norms.std():.4f}  "
-          f"[{norms.min():.4f}, {norms.max():.4f}]")
-    n_fail_calib = int((calib & ~success).sum())
-    if n_fail_calib:
-        print(f"    NB {n_fail_calib}/{int(calib.sum())} calibration episodes are failures and are kept "
-              "in the nominal pool (the spec says to ignore this contamination)")
-
-    print(f"\n  {'pool':<10} {'episodes':>9} {'steps':>8} {'ep len (min/med/max)':>24}  "
-          f"{'tau spacing (med)':>18}")
-    for key, tab in tabs.items():
-        L = tab["lengths"]
-        if not len(L):
-            print(f"  {key:<10} {0:>9} {0:>8}")
-            continue
-        print(f"  {key:<10} {len(L):>9} {len(tab['row']):>8} "
-              f"{L.min():>8} /{int(np.median(L)):>5} /{L.max():>5}   {1 / np.median(L):>17.4f}")
-    print("  (episode length is the success/failure confound the spec warns about -- it is "
-          "why the pools are\n   built from steps and why every pool is subsampled to a "
-          "common size at each t)")
+# ------------------------------------------------------------------------------- plotting
+#: Green for success, red for failure, per the spec.
+CURVES = (("success", "tab:green"), ("failure", "tab:red"))
 
 
-def report_grid(task: str, df: pd.DataFrame) -> None:
-    """The AUROC grid as a table, plus the success/failure gap that answers the question."""
-    print(f"\n  --- AUROC grid, {task} ---")
-    show = df.copy()
-    show["auroc"] = show["auroc"].round(4)
-    show["fold_mean"] = show["fold_mean"].round(4)
-    show["fold_std"] = show["fold_std"].round(4)
-    print(show.to_string(index=False, na_rep="  --  "))
-
-    wide = df.pivot_table(index="t", columns="comparison", values="auroc")
-    if {"success", "failure"} <= set(wide.columns):
-        wide["gap (fail - succ)"] = wide["failure"] - wide["success"]
-        print(f"\n  --- {task}: how much of the separability is actually about failure? ---")
-        print(wide.round(4).to_string(na_rep="  --  "))
-        gap = wide["gap (fail - succ)"].dropna()
-        if len(gap):
-            print(f"  gap: mean {gap.mean():+.4f}  max {gap.max():+.4f} at t={gap.idxmax():.2f}  "
-                  f"min {gap.min():+.4f} at t={gap.idxmin():.2f}")
+def _fold_list(cell) -> np.ndarray:
+    """The per-fold AUROCs of one row, by fold id. Empty when the point was never scored."""
+    if not isinstance(cell, str) or not cell:
+        return np.zeros(0)
+    return np.array([float(v) for v in cell.split(";") if v])
 
 
-def report_summary(df: pd.DataFrame) -> None:
-    """One block that puts every task side by side, which is what the plot shows."""
-    print(f"\n\n{'=' * 78}\n=== summary: AUROC vs normalized time\n{'=' * 78}")
-    for key in [k for k in ("success", "failure", "null_ctrl") if k in set(df["comparison"])]:
-        wide = df[df["comparison"] == key].pivot_table(index="Task", columns="t", values="auroc")
-        wide = wide.reindex([t for t in ALL_TASKS if t in wide.index])
-        print(f"\n  -- {key} vs nominal --")
-        print(wide.round(3).to_string(na_rep=" -- "))
+def did_curve(df: pd.DataFrame, task: str) -> pd.DataFrame:
+    """Per-``t`` difference-in-differences, with a confidence interval on the DiD itself.
 
-    if {"success", "failure"} <= set(df["comparison"]):
-        piv = df.pivot_table(index=["Task", "t"], columns="comparison", values="auroc")
-        piv["gap"] = piv["failure"] - piv["success"]
-        gaps = piv.groupby("Task")["gap"].agg(["mean", "max"])
-        late = piv.reset_index()
-        late = late[late["t"] >= 0.75].groupby("Task")["gap"].mean().rename("mean (t>=0.75)")
-        out = gaps.join(late).reindex([t for t in ALL_TASKS if t in gaps.index])
-        print("\n  -- failure-minus-success AUROC gap (the separability actually available "
-              "to a failure detector) --")
-        print(out.round(4).to_string(na_rep=" -- "))
+    The estimand Q3 asks about is one number per grid point,
 
+        DiD = (failure − success | obs+act) − (failure − success | obs),
 
-# ------------------------------------------------------------------------------ the plot
-def plot(df: pd.DataFrame, tasks: list[str], binned: bool, stem: pathlib.Path) -> None:
-    """Five stacked panels, one per task: AUROC against normalized time."""
-    tasks = [t for t in tasks if t in set(df["Task"])]
-    fig, axes = plt.subplots(len(tasks), 1, figsize=(7.2, 2.15 * len(tasks) + 1.2),
-                             sharex=True, constrained_layout=True)
-    axes = np.atleast_1d(axes)
-    handles: list = []
+    a contrast of four AUROCs. Forming it **inside each fold** before averaging is what makes
+    an interval possible: the four AUROCs of one fold share its held-out episodes -- both
+    comparisons hold out the same nominal episodes, both feature sets hold out the same
+    episodes on both sides -- so each fold is one measurement of the estimand.
 
-    lo = min(0.45, float(np.nanmin(df["auroc"])) - 0.03) if df["auroc"].notna().any() else 0.4
-    for ax, task in zip(axes, tasks):
-        sub = df[df["Task"] == task]
-        ax.axhline(0.5, color="#8c8c88", lw=1.0, ls=":", zorder=1)
-        for key, (label, colour, ls, marker) in SERIES.items():
-            s = sub[sub["comparison"] == key].sort_values("t")
+    The band is therefore a **95% Student-t CI on the mean DiD** (``k - 1`` df), not the
+    fold-to-fold spread: the question is whether the DiD differs from zero, not how much the
+    contrast wobbles between folds. At ``k = 5`` the critical value is 2.78, so the interval
+    is about ±1.24 fold standard deviations.
+
+    Caveats: neighbouring folds train on overlapping 4/5 subsets, so the interval is if
+    anything optimistic, and it covers fold resampling only -- not drawing new rollouts.
+
+    Returns per ``t`` the fold-mean DiD (the plotted line), its CI, and the same DiD from the
+    pooled AUROCs as a cross-check.
+    """
+    parts = {}
+    for fs in FEATURE_SETS:
+        for comp in COMPARISONS:
+            s = df[(df["task"] == task) & (df["features"] == fs) & (df["comparison"] == comp)]
             if s.empty:
-                continue
-            band = s["fold_std"].to_numpy()
-            ax.fill_between(s["t"], s["auroc"] - band, s["auroc"] + band,
-                            color=colour, alpha=0.13, lw=0, zorder=2)
-            line, = ax.plot(s["t"], s["auroc"], color=colour, ls=ls, marker=marker, ms=5.0,
-                            lw=2.0, mew=1.4, mec="white", label=label, zorder=3)
-            if ax is axes[0]:
-                handles.append(line)
-        nul = sub[sub["comparison"] == "null_ctrl"].sort_values("t")
-        if not nul.empty:
-            line, = ax.plot(nul["t"], nul["auroc"], color="#8c8c88", ls="-", lw=1.4, marker="s",
-                            ms=3.5, label="nominal vs nominal (null)", zorder=2)
-            if ax is axes[0]:
-                handles.append(line)
+                return pd.DataFrame()
+            parts[(fs, comp)] = s.set_index("t").sort_index()
 
-        ax.set_ylim(lo, 1.02)
-        ax.set_ylabel("AUROC", fontsize=9)
-        ax.set_title(task, fontsize=10, loc="left", pad=4)
-        ax.grid(axis="y", color="#e6e6e2", lw=0.8)
-        ax.set_axisbelow(True)
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        for side in ("left", "bottom"):
-            ax.spines[side].set_color("#c9c9c4")
-        ax.tick_params(labelsize=8, color="#c9c9c4")
+    grid = None
+    for p in parts.values():
+        grid = p.index if grid is None else grid.intersection(p.index)
 
-        # Sample size goes on the title line rather than inside the axes: with five panels
-        # there is no corner that is free of a curve in all of them.
-        counts = sub[sub["t"] == sub["t"].max()]
-        if len(counts):
-            r = counts.iloc[0]
-            note = f"n = {int(r['n_per_class'])}/class at $t$=1, {int(r['n_splits'])} folds"
-            if sub["auroc"].isna().any():
-                first = sub.loc[sub["auroc"].notna(), "t"]
-                note = (f"n < {MIN_PER_CLASS}/class for $t$ < {first.min():.1f}; " + note
-                        if len(first) else f"n < {MIN_PER_CLASS}/class everywhere")
-            ax.set_title(note, fontsize=7.5, loc="right", color="#6e6e69", pad=4)
+    out = []
+    for t in grid:
+        folds = {k: _fold_list(p.loc[t, "fold_aurocs"]) for k, p in parts.items()}
+        # Fold ids are 0-based everywhere, so truncating to the shortest keeps them aligned.
+        width = min(len(a) for a in folds.values())
+        f = {k: a[:width] for k, a in folds.items()}
+        did = ((f[("obs+act", "failure")] - f[("obs+act", "success")])
+               - (f[("obs", "failure")] - f[("obs", "success")]))
+        did = did[np.isfinite(did)]
 
-    axes[-1].set_xlabel("normalized episode time  $t$   "
-                        + ("(pool: steps in the bin ending at $t$)" if binned
-                           else "(pool: all steps with $\\tau \\leq t$)"), fontsize=9)
-    axes[-1].set_xlim(0.0, 1.03)
-    # Bottom-outside: constrained_layout reserves space for an "outside" legend, and the
-    # bottom strip is the only one that is not also claimed by the suptitle.
-    fig.legend(handles=handles, loc="outside lower center", ncols=len(handles), fontsize=8.5,
-               frameon=False, handlelength=2.6, columnspacing=2.4)
-    fig.suptitle("Oracle separability from nominal data: random forest on observation "
-                 "embeddings,\ngrouped CV over episodes", fontsize=11)
+        k = len(did)
+        mean = float(did.mean()) if k else np.nan
+        half = (float(student_t.ppf(0.975, k - 1) * did.std(ddof=1) / np.sqrt(k))
+                if k > 1 else np.nan)
+        pooled = ((parts[("obs+act", "failure")].loc[t, "auroc"] - parts[("obs+act", "success")].loc[t, "auroc"])
+                  - (parts[("obs", "failure")].loc[t, "auroc"] - parts[("obs", "success")].loc[t, "auroc"]))
+        out.append({"t": t, "did": mean, "half": half, "lo": mean - half, "hi": mean + half,
+                    "fold_std": float(did.std(ddof=1)) if k > 1 else np.nan,
+                    "k": k, "pooled": float(pooled)})
+    return pd.DataFrame(out).sort_values("t")
 
+
+def _panel_title(df: pd.DataFrame, task: str, extra: str = "") -> str:
+    """``Task — nominal N ep, test N success / N failure, d_obs = ...`` plus ``extra``."""
+    head = df[(df["task"] == task) & (df["features"] == "obs")]
+    name = TASK_LABELS[task]
+    if len(head):
+        h = head.iloc[0]
+        n_succ = int(head[head["comparison"] == "success"]["n_ep_pos"].iloc[0])
+        n_fail = int(head[head["comparison"] == "failure"]["n_ep_pos"].iloc[0])
+        name += (f"   —   nominal {int(h['n_ep_nominal'])} ep,  test {n_succ} success / "
+                 f"{n_fail} failure,  d_obs = {int(h['d_obs'])}")
+    return name + extra
+
+
+def _finish(fig, axes, drawn, stem: pathlib.Path, subtitle: str, title: str) -> None:
+    """Shared scaffolding: legend on the first populated panel, labels, save as png + pdf."""
+    if drawn is not None:
+        drawn.legend(fontsize=8, loc="lower right", framealpha=0.9)
+    axes[-1].set_xlabel("normalized episode time $t$   (model pooled over all steps with $u \\leq t$)",
+                        fontsize=9)
+    # One size throughout: a suptitle cannot mix sizes, and a larger title line would push
+    # the subtitle past the 7.6 in canvas.
+    fig.suptitle(f"{title}\n{subtitle}", fontsize=9.8)
     for ext in ("png", "pdf"):
         path = stem.with_suffix(f".{ext}")
-        fig.savefig(path, dpi=200 if ext == "png" else None, bbox_inches="tight")
+        fig.savefig(path, dpi=160 if ext == "png" else None)
         print(f"  wrote {os.path.relpath(path, ROOT_DIR)}")
     plt.close(fig)
 
 
-# -------------------------------------------------------------------------------- driver
-def cache_path(task: str, args) -> pathlib.Path:
-    tag = (f"grid{args.grid}_max{args.max_per_class}_k{args.folds}_trees{args.trees}"
-           f"_seed{args.seed}{'_binned' if args.binned else ''}"
-           f"{'_null' if args.null_control else ''}")
-    return CACHE_DIR / f"{task}__{tag}.csv"
+def _panels():
+    return plt.subplots(len(TASKS), 1, figsize=(7.6, 14.0), sharex=True, constrained_layout=True)
 
 
+def _excluded_note(df: pd.DataFrame, task: str, ax) -> None:
+    meta = df[df["task"] == task]
+    note = (f"not evaluated: B = {int(meta['B'].iloc[0])} > 32\n(excluded from Q3 by the spec)"
+            if len(meta) else "not run\n(pass --tasks with this task)")
+    ax.text(0.5, 0.5, note, transform=ax.transAxes, ha="center", va="center", fontsize=9, color="0.35")
+
+
+def plot_absolute(df: pd.DataFrame, stem: pathlib.Path) -> None:
+    """Figure 1: observation-only AUROC against normalized episode time, one panel per task."""
+    lo = float(np.nanmin(df[df["features"] == "obs"]["auroc"].to_numpy(dtype=float)))
+    ylim = (max(0.0, min(0.45, lo) - 0.05), 1.02)
+
+    fig, axes = _panels()
+    drawn = None
+    for ax, task in zip(axes, TASKS):
+        sub = df[(df["task"] == task) & (df["features"] == "obs")]
+        ax.axhline(0.5, color="0.5", lw=0.9, ls=":", zorder=1)
+        if sub.empty:
+            _excluded_note(df, task, ax)
+        else:
+            for comp, colour in CURVES:
+                s = sub[sub["comparison"] == comp].sort_values("t")
+                # A spread of AUROCs cannot leave [0, 1] even where mean +- std would.
+                lo_b = np.clip(s["fold_mean"] - s["fold_std"], 0.0, 1.0)
+                hi_b = np.clip(s["fold_mean"] + s["fold_std"], 0.0, 1.0)
+                ax.fill_between(s["t"], lo_b, hi_b, color=colour, alpha=0.15, lw=0, zorder=2)
+                ax.plot(s["t"], s["auroc"], color=colour, marker="o", ms=3.5, lw=1.6,
+                        label=f"test {comp} vs nominal", zorder=3)
+            drawn = drawn or ax
+        ax.set_title(_panel_title(df, task), fontsize=9, loc="left")
+        ax.set_ylim(*ylim)
+        ax.set_ylabel("AUROC", fontsize=9)
+        ax.grid(alpha=0.25, lw=0.6)
+        ax.tick_params(labelsize=8)
+
+    _finish(fig, axes, drawn, stem,
+            f"random forest, {N_FOLDS}-fold CV over episodes;  line = pooled out-of-fold "
+            "AUROC,  band = per-fold mean ±1 std",
+            "Oracle separability from observation embeddings alone  (Q1 / Q2)")
+
+
+def plot_relative(df: pd.DataFrame, stem: pathlib.Path) -> None:
+    """Figure 2: the difference-in-differences against the observation-only baseline (Q3).
+
+    One curve per task, since the estimand is one number per grid point. y = 0 is "the action
+    channels changed nothing"; a band spanning 0 means no effect detectable on these folds.
+    """
+    curves = {task: did_curve(df, task) for task in TASKS}
+    baseline = _gap_frame(df, "obs").mean(axis=1)
+
+    # Scale to the curves and the *typical* interval, not the widest one: pretzel's t=0.1 CI
+    # is ±0.18 on a 20-row pool and would flatten every panel. Clipped ends are annotated.
+    populated = [c for c in curves.values() if not c.empty]
+    ends = np.abs(np.concatenate([np.concatenate([c["lo"], c["hi"]]) for c in populated])) \
+        if populated else np.array([0.05])
+    lines = np.abs(np.concatenate([c["did"] for c in populated])) if populated else np.array([0.0])
+    m = max(0.05, 1.18 * max(float(np.nanmax(lines)), float(np.nanquantile(ends, 0.90))))
+
+    fig, axes = _panels()
+    drawn = None
+    for ax, task in zip(axes, TASKS):
+        # Heavier than figure 1's chance line: here it is what the panel is measured against.
+        ax.axhline(0.0, color="0.25", lw=1.1, zorder=1)
+        c = curves[task]
+        if c.empty:
+            _excluded_note(df, task, ax)
+            extra = ""
+        else:
+            ax.fill_between(c["t"], c["lo"], c["hi"], color="tab:purple", alpha=0.15, lw=0,
+                            zorder=2, label="95% CI over folds")
+            ax.plot(c["t"], c["did"], color="tab:purple", marker="o", ms=3.5, lw=1.7,
+                    label="DiD: change in the failure−success gap", zorder=3)
+            drawn = drawn or ax
+
+            g = float(baseline.get(task, np.nan))
+            mean_did = float(c["did"].mean())
+            n_sig = int((np.sign(c["lo"]) == np.sign(c["hi"])).sum())
+            d_act = int(df[(df["task"] == task) & (df["features"] == "obs+act")]["d_act"].iloc[0])
+            extra = (f" + d_act = {d_act}\nobs-only gap {g:+.3f};  mean DiD {mean_did:+.3f}"
+                     f" = {100 * mean_did / g:+.0f}% of it;  CI excludes 0 at {n_sig}/{len(c)} points")
+
+            # Same numbers as a fraction of the gap this task's actions are perturbing, so
+            # the left axis has a denominator.
+            rel = ax.twinx()
+            rel.set_ylim(-100 * m / g, 100 * m / g)
+            rel.set_ylabel("% of obs-only gap", fontsize=8, color="0.4")
+            rel.tick_params(labelsize=7, colors="0.4")
+
+            off = int((c["hi"] > m).sum() + (c["lo"] < -m).sum())
+            if off:
+                ax.text(0.012, 0.96, f"{off} CI end(s) beyond the axis", transform=ax.transAxes,
+                        ha="left", va="top", fontsize=7, color="0.45")
+        ax.set_title(_panel_title(df, task, extra), fontsize=9, loc="left")
+        ax.set_ylim(-m, m)
+        ax.set_ylabel("change in the failure−success\nAUROC gap", fontsize=9)
+        ax.grid(alpha=0.25, lw=0.6)
+        ax.tick_params(labelsize=8)
+
+    _finish(fig, axes, drawn, stem,
+            "DiD = (fail − succ | obs+act) − (fail − succ | obs), in AUROC points, formed per fold\n"
+            "band = 95% CI (Student-t, 4 df);  right axis rescales it to % of that task's obs-only gap",
+            "Do the action channels help? Difference-in-differences vs the "
+            "observation-only baseline  (Q3)")
+
+
+# -------------------------------------------------------------------------------- reports
+def _pivot(df: pd.DataFrame, features: str, value: str) -> pd.DataFrame:
+    s = df[df["features"] == features]
+    out = s.pivot_table(index=["task", "comparison"], columns="t", values=value)
+    order = [(t, c) for t in TASKS for c in COMPARISONS if (t, c) in out.index]
+    return out.reindex(order)
+
+
+def report(df: pd.DataFrame) -> None:
+    """The tables that actually answer Q1-Q3."""
+    fmt = lambda v: f"{v:.3f}"  # noqa: E731
+
+    for features in FEATURE_SETS:
+        if df[df["features"] == features].empty:
+            continue
+        print(f"\n{'=' * 88}\n=== AUROC by normalized time -- features: {features}\n{'=' * 88}")
+        print(_pivot(df, features, "auroc").to_string(float_format=fmt, na_rep="  --  "))
+
+    print(f"\n{'=' * 88}\n=== Q1/Q2: failure AUROC minus success AUROC (obs only)\n{'=' * 88}")
+    print("  the control-adjusted signal. ~0 means failure steps are no more distinguishable")
+    print("  from nominal than success steps are, i.e. the one-class problem is hopeless.\n")
+    gap = _gap_frame(df, "obs")
+    print(gap.to_string(float_format=lambda v: f"{v:+.3f}", na_rep="  --  "))
+    print(f"\n  mean over t and tasks: {np.nanmean(gap.to_numpy(dtype=float)):+.4f}")
+    late = gap[[c for c in gap.columns if c >= 0.7]]
+    print(f"  mean over the late window t >= 0.7: {np.nanmean(late.to_numpy(dtype=float)):+.4f}")
+
+    weak = df[(df["features"] == "obs") & (df["auroc"] < 0.45)]
+    if len(weak):
+        print("\n  cells below 0.45 -- the forest ranks *held-out* episodes worse than chance. That is")
+        print("  the grouped-CV signature of a class whose own episodes are more heterogeneous among")
+        print("  themselves than they are different from the other class: a held-out nominal episode")
+        print("  lands where no training nominal episode did, so it is called 'test' more confidently")
+        print("  than the held-out test episodes are, and the ranking inverts. Read these as 'no")
+        print("  separation that generalises to an unseen episode'. Note the fold std: on stacking it")
+        print("  is 0.03 over thousands of rows, so this is reproducible, not sampling noise.")
+        for _, r in weak.iterrows():
+            print(f"    {r['task']:<11} {r['comparison']:<8} t={r['t']:.1f}  AUROC {r['auroc']:.3f}  "
+                  f"rows {int(r['n_rows']):>5}  episodes {int(r['n_ep_nominal'])}+{int(r['n_ep_pos'])}"
+                  f"  fold std {r['fold_std']:.3f}")
+
+    if not df[df["features"] == "obs+act"].empty:
+        print(f"\n{'=' * 88}\n=== Q3: do the action channels help? (obs+act minus obs)\n{'=' * 88}")
+        signed = lambda v: f"{v:+.3f}"  # noqa: E731
+        a = _pivot(df, "obs+act", "auroc")
+        b = _pivot(df, "obs", "auroc").reindex(a.index)
+        print("\n  -- change in AUROC per comparison (positive = actions help), pooled out-of-fold --")
+        print("  context only; neither row is the estimand, because both absorb any shift that has")
+        print("  nothing to do with failing. The contrast of the two is what Q3 asks about.\n")
+        print((a - b).to_string(float_format=signed, na_rep="  --  "))
+
+        dids = {task: did_curve(df, task) for task in TASKS}
+        dids = {k: v for k, v in dids.items() if not v.empty}
+
+        def did_table(column):
+            return pd.DataFrame({t: dict(zip(c["t"], c[column])) for t, c in dids.items()}).T
+
+        print("\n  -- DIFFERENCE-IN-DIFFERENCES: the change in the failure−success gap. Figure 2. --")
+        print("  formed per fold, then averaged over the 5 folds.\n")
+        print(did_table("did").to_string(float_format=signed, na_rep="  --  "))
+        print("\n  -- 95% CI half-width on that DiD (Student-t over folds, 4 df) --")
+        print(did_table("half").to_string(float_format=fmt, na_rep="  --  "))
+        print("\n  -- per task. Units are AUROC points; the gap the DiD perturbs is the scale. --")
+        base = _gap_frame(df, "obs").mean(axis=1)
+        for task, c in dids.items():
+            n_sig = int((np.sign(c["lo"]) == np.sign(c["hi"])).sum())
+            g, mean_did = float(base.get(task, np.nan)), float(c["did"].mean())
+            print(f"    {task:<11} obs-only gap {g:+.4f} (mean over t)   mean DiD {mean_did:+.4f}"
+                  f" = {100 * mean_did / g:+.0f}% of it   "
+                  f"typical CI half-width {np.nanmedian(c['half']):.4f}   "
+                  f"CI excludes 0 at {n_sig}/{len(c)} grid points   k = {int(c['k'].min())} folds")
+        allmean = float(np.nanmean(did_table("did").to_numpy(dtype=float)))
+        print(f"\n  mean DiD over t and tasks: {allmean:+.4f}")
+        print("\n  -- cross-check: the same DiD from the pooled AUROCs rather than the fold mean --")
+        print("  (the plotted line uses the fold mean so that it and its CI come from the same numbers)")
+        print(did_table("pooled").to_string(float_format=signed, na_rep="  --  "))
+
+    print(f"\n{'=' * 88}\n=== per-fold spread (obs only), to read the curves against\n{'=' * 88}")
+    print(_pivot(df, "obs", "fold_std").to_string(float_format=fmt, na_rep="  --  "))
+
+
+def _gap_frame(df: pd.DataFrame, features: str) -> pd.DataFrame:
+    """``task x t`` frame of (failure AUROC − success AUROC)."""
+    piv = _pivot(df, features, "auroc")
+    tasks = [t for t in TASKS if (t, "failure") in piv.index and (t, "success") in piv.index]
+    return pd.DataFrame(
+        {t: piv.loc[(t, "failure")] - piv.loc[(t, "success")] for t in tasks}
+    ).T.reindex(tasks)
+
+
+# ------------------------------------------------------------------------------------ run
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="separability", description=__doc__)
-    parser.add_argument("--tasks", nargs="+", default=ALL_TASKS, choices=ALL_TASKS)
-    parser.add_argument("--grid", type=int, default=10, help="number of normalized-time points")
-    parser.add_argument("--max-per-class", type=int, default=2000,
-                        help="cap on steps per class per fit; every pool is drawn to a common size")
-    parser.add_argument("--folds", type=int, default=5, help="max grouped-CV folds")
-    parser.add_argument("--trees", type=int, default=150, help="random forest size")
+    parser.add_argument("--tasks", nargs="+", default=TASKS, choices=TASKS)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--binned", action="store_true",
-                        help="pool only the steps inside the bin ending at t, not all steps up to t")
-    parser.add_argument("--null-control", action="store_true",
-                        help="also run nominal-vs-nominal, which must come out at chance")
-    parser.add_argument("--force", action="store_true", help="ignore the cache")
+    parser.add_argument("--force", action="store_true", help="recompute instead of reading the cache")
     parser.add_argument("--plot-only", action="store_true", help="redraw from the cache and exit")
-    parser.add_argument("--out", default=str(OUT_STEM), help="output stem for the .png / .pdf")
     args = parser.parse_args(argv)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     frames = []
     for task in args.tasks:
-        path = cache_path(task, args)
-        if path.exists() and not args.force:
-            frames.append(pd.read_csv(path))
-            print(f"[cache] {task} <- {os.path.relpath(path, ROOT_DIR)}")
+        cache = CACHE_DIR / f"{task}__seed{args.seed}.csv"
+        if cache.exists() and not args.force:
+            frames.append(pd.read_csv(cache))
+            print(f"loaded cached scores for {task} ({os.path.relpath(cache, ROOT_DIR)})")
             continue
         if args.plot_only:
-            print(f"[skip] {task}: no cache at {os.path.relpath(path, ROOT_DIR)}", file=sys.stderr)
+            print(f"no cache for {task}; skipping (--plot-only)", file=sys.stderr)
             continue
-        df = run_task(task, args)
-        df.to_csv(path, index=False)
-        frames.append(df)
+        frame = run_task(task, args.seed)
+        frame.to_csv(cache, index=False)
+        frames.append(frame)
 
     if not frames:
         print("nothing to plot", file=sys.stderr)
         return 1
-
     df = pd.concat(frames, ignore_index=True)
-    report_summary(df)
-    print()
-    plot(df, args.tasks, args.binned, pathlib.Path(args.out))
+
+    report(df)
+
+    print(f"\n{'=' * 88}\n=== figures\n{'=' * 88}")
+    plot_absolute(df, HERE / "separability_obs")
+    plot_relative(df, HERE / "separability_obs_act")
     return 0
 
 
