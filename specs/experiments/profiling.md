@@ -87,22 +87,6 @@ lifetime is what governs peak memory. Three m×m float64 matrices alive at once 
 `_loo_scores` is 183 MB at stacking's $m = 2760$ and 9.6 GB at $m = 20000$ — a fact no
 single peak-memory number conveys.
 
-Predictions worth confirming or refuting, computed from the shapes above for push_t's test
-pass ($N = 9458$):
-
-- `_chunks` materialises the whole subset's action tensor at once: `[9458, 256, 16, 3]`
-  float32 is 465 MB on the device, and if the numpy source is float64 there is a 930 MB
-  host array before it.
-- `sum` and `flat` return **views** — their `_parts` is a `reshape` of a contiguous
-  tensor and allocates nothing. `disp` allocates 29 MB. `sig` is the outlier: it builds
-  `paths` (465 MB), concatenates a time channel (620 MB), then `inc` and `pre` (581 MB
-  each), peaking near 2.3 GB.
-- `_parts` runs on all $N$ rows before `_embed` batches. The `_RFF_ELEM_BUDGET` cap
-  therefore bounds the RFF intermediate but not the parts tensor that feeds it.
-
-If those hold, the interesting design question is whether `sig`'s `_parts` should be
-batched on the same budget as `_embed`, and whether `_chunks` should stream.
-
 ## Deliverable 3 — peak memory
 
 Peak host RSS and peak CUDA allocated (plus reserved) per segment.
@@ -137,5 +121,6 @@ profile falsifiable: predict stacking from push_t, then check.
 
 ## Output
 
-A single self-contained HTML page, plus the raw per-seam measurements as CSV so the
-numbers can be re-plotted without re-running anything.
+A streamlit app that caches the results in .csv files so that they don't need to be regenerated on repeated runs. Create one Python file only.
+
+After building the app, do a visual verification that the layout has no issues (all labels should be visible).
