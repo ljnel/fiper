@@ -1,131 +1,167 @@
 """Regularized log-determinant kernel objective -- ``specs/experiments/logdet_kernel_objective.md``.
 
-The criterion
--------------
-``specs/methods.md`` fixes every bandwidth by the median heuristic. The alternative under
-test tunes them instead by
+``specs/methods.md`` sets every kernel bandwidth by the median heuristic, each one
+independently. The alternative studied here scores a whole bandwidth vector at once,
 
-    max_{theta, tau}   (1/n) log det(K_theta + lam I) + log(1 - tau)
-    s.t.               q_i(theta) <= tau  for all i,      0 <= tau < 1,
+    J(theta) = (1/n) logdet(K_theta + lam*n*I) + beta * log(1 - CVaR_alpha(q(theta))),
 
-with ``q_i`` the leave-one-out score of kern_cd on fit point ``i``.
+with ``q_i(theta)`` the leave-one-out kern_cd score of fit point ``i``. The first term
+rewards a kernel whose Gram matrix has volume -- i.e. one that keeps the fit points apart
+-- and the second penalizes a kernel under which the worst ``alpha`` fraction of the fit
+set already looks novel. The claim being tested is that the two together balance
+``sigma_o`` against ``sigma_A``, which the median heuristic cannot do because it never
+looks at the two kernels at the same time.
 
-**The constraint is not really a constraint.** ``log(1 - tau)`` is strictly decreasing in
-``tau`` and the constraints only bound it from below, so the inner problem is solved in
-closed form by ``tau* = max_i q_i(theta)`` and the whole thing collapses to an
-unconstrained objective in ``theta`` alone:
+How this is measured
+--------------------
+Both halves of the question live on one grid: ``sigma_o`` and ``sigma_A`` each swept over
+2^-4 .. 2^4 times their median heuristic in half-octaves (17 x 17 = 289 cells,
+``sigma_phi`` left at the median heuristic).
 
-    F(theta) = (1/n) log det(K_theta + lam I) + log(1 - max_i q_i(theta)).
+* The **criterion** is evaluated on every cell analytically, and cheaply. The packed
+  feature block is ``[o/sigma_o | mu_A/sigma_A]``, so a cell's kernel is
+  ``exp(-1/2 (D_o/sigma_o^2 + D_A/sigma_A^2))`` for two squared-distance matrices that do
+  not depend on the bandwidths at all: build those once, and a cell costs one Cholesky.
+  ``logdet`` comes off that factor's diagonal and the LOO scores off its inverse (the
+  identity in ``kern_cd_core._loo_scores``), so no scoring pass and no solver is involved.
+  ``tau`` and ``CVaR_alpha`` are read off the sorted scores. ``q_i`` is ``kern_cd``'s own
+  leave-one-*step*-out score by default; ``--loo episode`` holds out the whole episode
+  instead, from the same factor (:func:`_block_loo`).
+* The **headline TWA** is evaluated on every cell too, as a full FIPER evaluation -- the
+  same path ``my_methods/run.py`` takes, through a variant class that scales each
+  bandwidth by its multiplier. On pretzel that is ~0.6 s per cell.
+* The **mean off-diagonal value of each kernel factor** rides along, from the same two
+  distance matrices. It is what separates "the criterion balanced the two bandwidths" from
+  "the criterion switched one of them off" -- see :func:`factor_grid`.
 
-Feasibility is free rather than restrictive: for an RBF kernel ``q_i = k_ii - k^T(K_{-i} +
-lam I)^{-1} k <= k_ii = 1``, so ``tau < 1`` always holds (:func:`check_criterion` asserts
-both facts). That is what makes this cheap: one Cholesky of ``K + lam I`` gives the log-det
-*and*, via ``q_i = 1/B_ii - lam``, every LOO score -- the same identity
-``KernCDMethod._loo_scores`` already uses. No inner optimisation, no gradients.
+The one substantive claim this makes about ``kern_cd`` -- that a cell of
+:meth:`Calibration.cell` is the kernel the method would have fitted -- is checked against
+the method rather than assumed (``--check-only``; agreement to 1e-13 on pretzel).
 
-What the two terms want
------------------------
-They pull in opposite directions along a bandwidth, which is why the criterion has an
-interior optimum at all:
+Sweeping ``alpha`` and ``beta`` is then free: the criterion decomposes into a
+``beta``-independent ``logdet`` and one ``CVaR`` per ``alpha``, and the TWA of whatever
+cell a given ``(alpha, beta)`` selects is already in the landscape. So the study is not
+"tune, then evaluate" but "evaluate everything once, then ask what each rule would have
+picked" -- which also gives the oracle (the grid's best cell) to place both rules against.
 
-* ``sigma -> 0``: ``K -> I``, log-det term ``-> log(1 + lam)`` (its maximum), but every
-  point is isolated so ``q_i -> 1`` and the penalty ``-> -inf``.
-* ``sigma -> inf``: ``K -> 11^T``, every point supports every other so ``q_i -> 0`` and the
-  penalty ``-> 0``, but the gram matrix is rank-one and the log-det term ``-> -inf``.
-
-So term one is diversity in feature space and term two is "no fit point is an island". The
-median heuristic knows about neither.
-
-What is tuned
--------------
-The bandwidths the criterion can move without recomputing features: ``sigma_o`` always, and
-``sigma_A`` for the action-channel methods. ``sigma_phi`` -- the bandwidth *inside* the RFF
-feature map -- is left at its median value, because ``mu_A`` is a function of it, so moving
-it means re-drawing phi and re-embedding every part for every candidate. If the two cheap
-bandwidths show a real effect, that is the next thing to buy.
-
-How it is wired in
-------------------
-``KernCDMethod._pack`` is the one place where both bandwidths have been fixed but nothing
-has been consumed yet: ``fit`` calls it immediately after ``sigma_A``, and its output is
-what ``KernCD`` is fitted on. So the variant overrides ``_pack``, tunes on first call
-(the fit set) and delegates; later calls, from ``_features`` during scoring, see the tuned
-values already installed. Nothing in ``my_methods/`` is touched, and the scored estimator is
-byte-for-byte the ordinary one with two numbers changed.
+Scope, and what it costs
+------------------------
+``kern_cd_flat``, seed 0, all five tasks: 5 x 289 = 1445 end-to-end FIPER evaluations
+(about 100 minutes on an RTX 5090, dominated by stacking at ~11 s a cell) against 1445
+analytic criterion evaluations (seconds). The study started on pretzel alone, as the spec
+asks, and widened because pretzel turned out to be the wrong place to ask the question:
+its whole TWA landscape spans 0.716-0.758 and its balanced accuracy is 0.900 in every one
+of the 289 cells, so no tuning rule can be told from any other there.
 
 What it found
 -------------
-Seed 0 unless noted; the summary below is what ``--summary --all-seeds`` prints.
+**1. At the setting the spec starts from, the criterion does not improve the headline.**
+Headline TWA against the median heuristic, at ``alpha = 0.05``, ``beta = 1``:
 
-**The criterion does not improve headline results.** Averaged over the cached seeds, across
-17 (task, method) cells, the log-det-tuned twin beats the median heuristic by **+0.0016 TWA**
-on the headline (best window and threshold style, quantile-averaged -- what
-``paper_table.py`` reports) and loses **-0.0111 TWA** on the grid mean over all 510
-configurations. Those two disagreeing is the whole result: the headline improves in 11 of 17
-cells while the grid mean improves in 4, which is the signature of a better argmax rather
-than a better method. The paired per-configuration comparison agrees -- on sorting the
-tuned arm wins 37-45% of the 510 cells and loses 54-62% of them, while its headline goes
-*up* by ~+0.02.
+    pretzel -0.004   push_t -0.008   push_chair -0.049   sorting +0.024   stacking -0.016
 
-**The criterion is well behaved; it is just optimising the wrong thing.** It always finds an
-interior optimum (the two terms are monotone in opposite directions), it always improves its
-own objective (+0.4 to +1.7 nats), and its choice is stable across seeds to within 1%. It is
-also consistent about direction: on every task it shrinks ``sigma_o`` to 0.31-0.84x the
-median heuristic, and on the action methods it moves the two bandwidths *in opposite
-directions* -- ``sigma_o`` down to ~0.4x, ``sigma_A`` up to ~1.8x -- so the spec's
-expectation that different channels want different bandwidths is confirmed. That is a real
-structural finding; it just does not pay.
+Four of five tasks lose; the mean is -0.011 TWA. It is not that the bandwidths do not
+matter -- the best cell of the same grid beats the median heuristic by +0.005, +0.021,
++0.081, +0.062 and +0.024 -- so there is real headroom on every task and the criterion is
+not finding it. Nor is it that the two knobs were set badly: the best ``(alpha, beta)`` in
+the whole 7 x 9 sweep, *chosen by the test-set TWA it produces*, recovers a little over
+half of that headroom (+0.001, +0.016, +0.028, +0.042, +0.019 against +0.005, +0.021,
++0.081, +0.062, +0.024) -- and that rule cannot be run in practice, so it is a ceiling, not
+a result.
 
-**Why it does not pay: TWA barely depends on the bandwidth, and where it does, the criterion
-usually pushes the wrong way.** ``--sweep`` scores 13 fixed multipliers end-to-end through
-FIPER. Over the full 64x range of ``sigma_o``, the best achievable headline TWA exceeds the
-median heuristic's by only +0.0002 (pretzel), +0.011 (sorting), +0.021 (push_t), +0.033
-(push_chair) and +0.035 (stacking) -- and the TWA-optimal multiplier is 0.71x, 0.125x, 1.41x,
-8x and 0.177x respectively. There is no consistent direction to move in, the total prize is
-a few TWA points, and the criterion's uniform "shrink" is the right sign on two tasks of
-five.
+**2. ``beta`` is an exchange rate between two quantities that have no common scale, and it
+is not the same exchange rate twice.** The ``beta`` at which the two terms are of equal
+median size over the grid is
 
-Two further cautions, both from the diagnostics this file prints:
+    push_chair 0.10,   push_t 2.3,   sorting 8.2,   stacking 10.7,   pretzel 19.8,
 
-* The criterion's ``lam`` is a free knob that ``specs/methods.md`` does not pin (it fixes
-  ``lam`` for the *estimator*, where the ridge is ``lam*m``). Sweeping it over four orders of
-  magnitude moves the chosen multiplier from 0.82x to 1.88x on push_chair -- i.e. across the
-  median heuristic and out the other side. Nothing in the criterion says which value to use.
-* ``tau = max_i q_i`` is a maximum over the fit set, so the penalty term is a function of the
-  single most isolated calibration step. Replacing it with the 95th percentile of ``q`` moves
-  the chosen multiplier by ~35%.
+a 200x spread. At ``beta = 1`` the barrier is under a tenth of the log-determinant on 25%
+to 55% of the grid, depending on the task -- so on most tasks ``beta = 1`` is not a balance
+between the two terms at all, it is the log-determinant with a rounding error attached, and
+the picks show it: at ``beta = 1`` the criterion moves ``sigma_o`` to 0.25-0.5x the median
+heuristic on four of five tasks, because a narrower kernel is a larger determinant.
 
-And a measurement caution: on the two smallest tasks the seed-to-seed spread of the delta
-(0.098 TWA for ``kern_cd_sig`` on push_chair, where seed 0 gives -0.070 and seeds 1-2 give
-+0.025/+0.028) is far larger than the effect. Single-seed cells on small tasks say nothing.
+**3. Where the criterion does win, it wins by deleting the action channel.** On sorting,
+its +0.024, it picks ``sigma_A`` = 16x the median heuristic, at which the mean off-diagonal
+action factor is 0.998 -- the product kernel's action factor is uniformly 1, i.e. the method
+has reverted to ``kern_cd_obs``. Pretzel's pick is the same degeneracy (``sigma_A`` 16x,
+factor 0.998) and merely does not pay off. This is the mechanism ``hyperparam_sensitivity``
+documents from the other direction, and it is the opposite of the thing being tested: the
+criterion was supposed to *balance* the observation and action bandwidths.
 
-**Verdict: not worth adopting.** Tuning bandwidths on this objective costs ~50 Cholesky
-factorisations and returns a headline change indistinguishable from zero, on a knob whose
-whole end-to-end headroom is a few TWA points. The unexplored direction, if any, is
-``sigma_phi``, which this study does not touch.
+**4. There is no ``(alpha, beta)`` that is right on more than one task.** Over the 289
+cells, the Spearman correlation between ``J(theta)`` and headline TWA at the headline
+setting is -0.14, +0.08, -0.10, -0.41, +0.20 -- i.e. no relationship, and negative more
+often than not. Each task does have a region of the ``(alpha, beta)`` box where the
+criterion correlates decently (best +0.20, +0.50, +0.51, +0.41, +0.73), but the regions are
+in opposite corners: push_t wants small ``alpha`` and large ``beta``, push_chair, sorting
+and stacking want the reverse. Since the sign of the correlation flips across tasks at
+every fixed setting, this is not a knob that needs tuning; it is a criterion whose ordering
+of kernels has no stable relation to the benchmark's.
+
+**5. Reusing ``tau`` as the threshold is not a separate idea.** ``tau`` is by construction
+the ``(1-alpha)``-quantile of the LOO scores, and FIPER's conformal thresholds are quantiles
+of exactly those scores, so "use ``tau``" means "keep the ``1-alpha`` column of FIPER's
+quantile grid instead of averaging over all ten". It helps both rules a little on the three
+tasks where it does anything (the median heuristic gains +0.032, +0.014, +0.006 on
+push_chair, sorting and stacking, and +-0.000 on the other two), and it does not change
+which rule wins: the criterion still trails the median heuristic on the same four tasks and
+leads on sorting, by margins within 0.02 of the ones above.
+
+**6. None of this is an artefact of leaving out one step rather than one episode.** The
+default ``q_i`` is ``kern_cd``'s own, i.e. leave-one-*step*-out, which is the weaker
+definition: the fit set is pooled steps, so holding out one step leaves its temporal
+neighbours in and they re-interpolate it. ``--loo episode`` holds out the whole episode
+instead (closed form in :func:`_block_loo`, checked against refitting with the episode
+deleted). The scores do inflate -- the median CVaR over the grid goes 0.19 -> 0.73 on
+stacking and 0.65 -> 0.85 on push_t, and barely moves on pretzel and push_chair -- but the
+criterion picks the *same cell* on three of five tasks, the headline goes from -0.011 to
+-0.008 TWA on average and stays negative on four of five, and the ``beta`` that balances
+the two terms still spans 0.085 to 18.4 across tasks. Point 3 strengthens: under
+episode-LOO, stacking's pick moves to ``sigma_A`` = 16x as well, so three of five picks now
+have the action channel switched off. One caveat in the other direction: ``tau`` under
+episode-LOO is no longer a quantile of the scores FIPER thresholds on, so the "reuse
+``tau`` as the threshold" property of the spec does not survive this change.
+
+**What this does not settle.** One seed and one of the four action-channel kernels;
+``sigma_phi`` is left at the median heuristic throughout, so the criterion was never asked
+to balance all three bandwidths at once. The grid is half-octaves over +-4 octaves, so a
+pick is resolved to within a factor of 1.4. push_chair's fit set is 49 steps, which is few
+enough that its LOO scores -- and therefore its CVaR -- are themselves noisy. Points 2 and 3
+are structural and would survive all of that; point 1 is five numbers at one seed.
 
 Running it
 ----------
-    pixi run python my_experiments/logdet_kernel/logdet_kernel.py                     # push_chair, obs only
-    pixi run python my_experiments/logdet_kernel/logdet_kernel.py --task pretzel
-    pixi run python my_experiments/logdet_kernel/logdet_kernel.py --methods kern_cd_obs kern_cd_disp
-    pixi run python my_experiments/logdet_kernel/logdet_kernel.py --check-only        # just the algebra
-    pixi run python my_experiments/logdet_kernel/logdet_kernel.py --sweep             # TWA over the whole axis
-    pixi run python my_experiments/logdet_kernel/logdet_kernel.py --summary --all-seeds
+    pixi run python my_experiments/logdet_kernel/logdet_kernel.py                 # pretzel, kern_cd_flat
+    pixi run python my_experiments/logdet_kernel/logdet_kernel.py --check-only    # verify the machinery
+    pixi run python my_experiments/logdet_kernel/logdet_kernel.py --task push_t
+    pixi run python my_experiments/logdet_kernel/logdet_kernel.py --report        # cached cells only
+    # the whole study, from the cache:
+    pixi run python my_experiments/logdet_kernel/logdet_kernel.py \
+        --task pretzel push_t push_chair sorting stacking --report
+    # the same, with the LOO score taken over whole episodes (finding 6):
+    pixi run python my_experiments/logdet_kernel/logdet_kernel.py \
+        --task pretzel push_t push_chair sorting stacking --loo episode --report
 
-Per-(task, method) metric grids are cached as CSVs under
-``my_experiments/logdet_kernel/cache/`` and reused; ``--force`` re-runs. The landscape scan,
-the sweep and their plots land in the same directory. Nothing under ``data/`` is written.
+Per-cell metric grids and criterion grids are cached under
+``my_experiments/logdet_kernel/cache/``; ``--force`` re-runs them. The two LOO definitions
+cache side by side (``--loo episode`` output carries a ``__loo_episode`` tag) and share the
+same TWA landscape, which does not depend on how ``q_i`` is defined. Nothing in
+``my_methods/`` is modified, but FIPER's own eval class writes a small pickle per cell
+into ``data/<task>/results/<cell>/``; every name this file creates starts with ``ldk_``,
+so the litter is removable with ``rm -rf data/*/results/ldk_*``.
 """
 
 from __future__ import annotations
 
 import argparse
-import itertools
 import os
 import pathlib
 import sys
-from dataclasses import dataclass, field
+import textwrap
+import time
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT_DIR = str(HERE.parent.parent)
@@ -135,1049 +171,1127 @@ os.chdir(ROOT_DIR)
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from scipy.linalg import cho_factor, cho_solve, solve_triangular  # noqa: E402
-from scipy.optimize import minimize  # noqa: E402
+from scipy.linalg import solve_triangular  # noqa: E402
 from sklearn.metrics.pairwise import euclidean_distances  # noqa: E402
 
 from my_methods import run as run_mod  # noqa: E402
-from my_methods.base import REGISTRY, discover  # noqa: E402
-from my_methods.kern_cd_core import KernCDMethod  # noqa: E402
+from my_methods.base import REGISTRY, build_cfg, discover  # noqa: E402
 
-CACHE_DIR = str(HERE / "cache")
+CACHE_DIR = HERE / "cache"
 
-#: Suffix appended to a base method's name to get its log-det-tuned twin.
-SUFFIX = "_logdet"
+#: Half-octaves over +-4 octaves: a 256x range on each bandwidth, wide enough to bracket
+#: both degenerate regimes (kernel ~ I at the bottom, kernel ~ all-ones at the top).
+EXPONENTS = tuple(np.arange(-4.0, 4.5, 0.5))
+MULTS = tuple(2.0**e for e in EXPONENTS)
 
-#: Bandwidth search range, as log2 multiples of the median heuristic: [1/8, 8].
-GRID_LO, GRID_HI = -3.0, 3.0
-#: Grid points per bandwidth. One bandwidth gets a fine grid for free; two get the square.
-GRID_N_1D, GRID_N_2D = 25, 13
+#: Tail fractions. 1.0 is the mean -- CVaR with no tail selection at all -- and is kept as
+#: the degenerate end of the sweep.
+ALPHAS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
+
+#: Weights on the CVaR barrier. beta = 1 is the spec's starting point; the sweep is
+#: geometric because the two terms are both logs, so what matters is their ratio.
+BETAS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0)
+
+#: The tail fraction the beta sweep and the headline rows run at, fixed in advance. It has
+#: to be fixed in advance: picking it by the TWA it produces would be tuning the criterion
+#: on the test set, and the sweep tables would then have nothing left to say. 0.05 is the
+#: natural choice -- a 5% tail, and ``tau`` then lands exactly on FIPER's 0.95 quantile.
+ALPHA_DEFAULT = 0.05
+
+#: Cells evaluated per ``_evaluate_task`` call (the processed dataset is rebuilt per call,
+#: and a group is the unit of crash recovery, so this is a rebuild-time / blast-radius
+#: trade). Also caps how many m x m Cholesky factors are alive at once.
+GROUP = 16
+
+#: Defaults from ``specs/methods.md``.
+LAM, N_COMPONENTS = 1.0e-5, 128
 
 
-# --------------------------------------------------------------------------- the criterion
-def sq_dists(X: np.ndarray) -> np.ndarray:
-    """Pairwise squared euclidean distances, by the same route ``RBF`` takes.
-
-    ``cd.algs.kernels.RBF`` calls sklearn's ``rbf_kernel``, which is
-    ``exp(-gamma * euclidean_distances(X, squared=True))``. Using the same function here is
-    what makes the criterion's gram matrix identical to the one ``KernCD`` will factor,
-    rather than merely equal to it up to a different summation order -- which is what lets
-    :func:`loo_check` assert agreement at 1e-10 instead of hoping for 1e-6.
-    """
-    return euclidean_distances(X, X, squared=True)
-
-
+# ------------------------------------------------------------------- the cheap criterion
 @dataclass
-class Terms:
-    """One evaluation of the criterion, kept in pieces because the pieces are the story."""
+class Calibration:
+    """Everything about a fit set that does not depend on the bandwidths being swept."""
 
-    obj: float
-    logdet: float  # (1/n) log det(K + lam I)
-    penalty: float  # log(1 - tau)
-    tau: float  # max_i q_i, the tight slack
-    sigmas: np.ndarray
+    task: str
+    method: str
+    seed: int
+    m: int
+    sigma_o: float  # median heuristic
+    sigma_phi: float
+    sigma_A: float
+    D_o: np.ndarray  # [m, m] squared distances between observation embeddings
+    D_A: np.ndarray  # [m, m] squared distances between mean embeddings mu_A
+    episode: np.ndarray  # [m] index of the fit episode each row came from
 
+    def cell(self, mult_o: float, mult_A: float, blocked: bool = False) -> tuple[float, np.ndarray]:
+        """``((1/m) logdet(K + lam*m*I), LOO scores)`` at one point of the grid.
 
-class Criterion:
-    """``F(theta)`` at fixed features, as a function of log-bandwidth multipliers.
+        The product kernel is a single RBF on the packed block ``[o/sigma_o | mu/sigma_A]``
+        (see ``kern_cd_core``), so its exponent is a bandwidth-weighted sum of the two
+        precomputed distance matrices and the whole cell costs one Cholesky.
 
-    The features (observation embeddings, and the mean embeddings ``mu_A`` for an action
-    method) do not depend on ``sigma_o`` or ``sigma_A`` at all -- those two only *rescale*
-    the blocks of ``z = [o/sigma_o | mu_A/sigma_A]``. And a product of RBFs on the blocks is
-    one RBF on ``z``:
-
-        ||z - z'||^2 = ||o - o'||^2 / sigma_o^2 + ||mu - mu'||^2 / sigma_A^2.
-
-    So the per-block squared distances are computed once, up front, and a candidate costs
-    only ``exp`` of their weighted sum plus one Cholesky -- no feature recomputation, no
-    kernel construction from raw data. That is the difference between a scan that takes
-    seconds and one that takes an hour.
-    """
-
-    def __init__(self, blocks: list[np.ndarray], sigmas: list[float], ridge: float, tau_q: float = 1.0):
-        self.sq = [sq_dists(np.ascontiguousarray(X)) for X in blocks]
-        self.sigma0 = np.asarray(sigmas, dtype=float)
-        self.ridge = float(ridge)
-        #: Quantile of ``q`` standing in for ``tau``. 1.0 is the criterion as specified --
-        #: ``tau`` upper-bounds *every* ``q_i``. Anything less is a deliberate weakening,
-        #: used only by :func:`report_tau_robustness` to measure how much of the criterion's
-        #: answer rests on the single most isolated fit point.
-        self.tau_q = float(tau_q)
-        self.m = int(self.sq[0].shape[0])
-        self.n_evals = 0
-
-    @property
-    def n_blocks(self) -> int:
-        return len(self.sq)
-
-    def gram(self, u: np.ndarray) -> np.ndarray:
-        sigmas = self.sigma0 * np.exp(np.asarray(u, dtype=float).ravel())
-        acc = np.zeros_like(self.sq[0])
-        for D2, s in zip(self.sq, sigmas):
-            acc += D2 / (s * s)
-        return np.exp(-0.5 * acc)
-
-    def terms(self, u: np.ndarray) -> Terms:
-        """Evaluate at ``sigma = sigma_median * exp(u)``.
-
-        An infeasible or numerically degenerate candidate returns ``-inf`` rather than
-        raising: at very small bandwidths ``tau`` reaches 1 in double precision (every point
-        genuinely is an island), which is the criterion correctly assigning it no value.
+        ``blocked`` switches from leave-one-*step*-out to leave-one-*episode*-out; see
+        :func:`_block_loo` for why the distinction matters and what it costs.
         """
-        self.n_evals += 1
-        sigmas = self.sigma0 * np.exp(np.asarray(u, dtype=float).ravel())
-        K = self.gram(u)
-        M = K + self.ridge * np.eye(self.m)
-        try:
-            L = np.linalg.cholesky(M)
-        except np.linalg.LinAlgError:
-            return Terms(-np.inf, -np.inf, -np.inf, 1.0, sigmas)
-        logdet = float(2.0 * np.sum(np.log(np.diag(L))) / self.m)
-        q = self.loo(L)
-        # tau is the tightest feasible slack (see the module docstring); clipped into
-        # [0, 1) only against roundoff, never to hide an infeasible candidate -- q > 1 is
-        # impossible for this kernel and q < 0 only ever appears at the 1e-16 level.
-        tau = float(min(max(q.max() if self.tau_q >= 1.0 else np.quantile(q, self.tau_q), 0.0), 1.0))
-        if tau >= 1.0:
-            return Terms(-np.inf, logdet, -np.inf, tau, sigmas)
-        penalty = float(np.log1p(-tau))
-        return Terms(logdet + penalty, logdet, penalty, tau, sigmas)
-
-    def loo(self, L: np.ndarray) -> np.ndarray:
-        """``q_i = 1/B_ii - lam``, ``B = (K + lam I)^{-1}`` -- kern_cd's own LOO identity.
-
-        Identical to ``KernCDMethod._loo_scores`` (which writes the ridge as ``lam * m``);
-        :func:`loo_check` asserts that on the fitted models rather than taking it on trust.
-        """
-        L_inv = solve_triangular(L, np.eye(L.shape[0]), lower=True)
-        return 1.0 / np.einsum("ki,ki->i", L_inv, L_inv) - self.ridge
+        K = np.exp(-0.5 * (self.D_o / (mult_o * self.sigma_o) ** 2 + self.D_A / (mult_A * self.sigma_A) ** 2))
+        lam_m = LAM * self.m
+        L = np.linalg.cholesky(K + lam_m * np.eye(self.m))
+        logdet = 2.0 * float(np.sum(np.log(np.diag(L)))) / self.m
+        L_inv = solve_triangular(L, np.eye(self.m), lower=True)
+        if blocked:
+            return logdet, _block_loo(L_inv, self.episode, lam_m)
+        return logdet, 1.0 / np.einsum("ki,ki->i", L_inv, L_inv) - lam_m
 
 
-def objective_at_fit(impl) -> Terms:
-    """The criterion at a *fitted* method's own bandwidths, for free.
+def _block_loo(L_inv: np.ndarray, episode: np.ndarray, lam_m: float) -> np.ndarray:
+    """Leave-one-*episode*-out support scores, from the same Cholesky factor.
 
-    Both ingredients are already lying around after ``fit``: the Cholesky factor of
-    ``K + lam*m*I`` on the model, and the LOO scores on the method. So the baseline's
-    objective value costs no kernel evaluation at all -- which is the number the tuned
-    variant has to beat.
+    The fit set is pooled steps, and consecutive steps of one episode are nearly duplicates
+    of each other. Holding out a single step therefore leaves its own neighbours in the fit
+    set, which re-interpolate it almost perfectly: the step-wise score says "this point is
+    not novel" when all it has established is "this point is not novel *given the rest of
+    its own episode*". Holding out the whole episode is the honest version, and it is what
+    the CVaR term needs, since that term is supposed to measure how novel the fit set
+    already looks.
+
+    With ``A = (K + lam*m*I)^-1 = (L L^T)^-1``, the block analogue of ``1/A_ii`` is
+    ``diag(inv(A_BB))``: the posterior covariance of block ``B`` with ``B`` removed is the
+    inverse of ``A`` restricted to ``B``. ``A_BB = (L^-1 e_B)^T (L^-1 e_B)`` is read straight
+    off the columns of ``L^-1``, so no full inverse is formed and the cost is
+    ``m * sum_B |B|^2`` -- a few hundred megaflops even at stacking's m = 2760.
+    :func:`check_block_loo` verifies it against refitting with the episode deleted.
     """
-    m = len(impl.model.data)
-    logdet = float(2.0 * np.sum(np.log(np.diag(impl.model.L))) / m)
-    tau = float(min(max(np.asarray(impl.loo_scores).max(), 0.0), 1.0))
-    penalty = float(np.log1p(-tau)) if tau < 1.0 else -np.inf
-    sigmas = np.array([impl._sigma_o] + ([impl._sigma_A] if impl.uses_actions else []))
-    return Terms(logdet + penalty, logdet, penalty, tau, sigmas)
+    loo = np.empty(L_inv.shape[1])
+    for b in np.unique(episode):
+        idx = np.flatnonzero(episode == b)
+        block = L_inv[:, idx]
+        loo[idx] = np.diag(np.linalg.inv(block.T @ block)) - lam_m
+    return loo
 
 
-def loo_check(impl) -> float:
-    """Max relative gap between :class:`Criterion`'s ``q`` and the method's ``loo_scores``.
+def prepare(task: str, method: str, seed: int, mult_phi: float = 1.0) -> Calibration:
+    """Build the fit set's distance matrices and median-heuristic bandwidths.
 
-    The criterion is only measuring the right thing if its ``q_i`` *is* the estimator's LOO
-    score. Recomputing it from the packed matrix the model was fitted on -- rather than from
-    the criterion's own blocks -- checks the whole chain, scaling included.
+    This walks the method's own feature pipeline -- the mask that drops push_t's failed
+    calibration episodes, ``_obs``, ``_parts``, the RFF draw, ``_embed`` -- and stops just
+    before the bandwidths would be applied, so nothing here reimplements the method.
     """
-    Z = np.asarray(impl.model.data)
-    m = len(Z)
-    ridge = float(impl.model.lam_) * m
-    L = np.linalg.cholesky(np.exp(-0.5 * sq_dists(Z)) + ridge * np.eye(m))
-    L_inv = solve_triangular(L, np.eye(m), lower=True)
-    q = 1.0 / np.einsum("ki,ki->i", L_inv, L_inv) - ridge
-    ref = np.asarray(impl.loo_scores)
-    return float(np.max(np.abs(q - ref) / np.maximum(np.abs(ref), 1e-12)))
+    import torch
 
+    from shared_utils.hydra_utils import load_config
+    from tasks import TaskManager
 
-def check_criterion(seed: int = 0) -> None:
-    """Verify on synthetic data everything the module docstring asserts about the criterion.
-
-    Four claims, in the order they are relied on:
-
-    1. ``q_i`` is the honest leave-one-out variance -- it matches refitting from scratch
-       with point ``i`` deleted.
-    2. ``q_i <= 1``, so ``tau < 1`` is never binding and the problem is always feasible.
-    3. ``tau* = max_i q_i``: no smaller value is feasible, no larger one scores better.
-    4. The two terms are monotone in opposite directions along a bandwidth, so ``F`` has an
-       interior optimum rather than running off to an edge.
-    """
-    rng = np.random.default_rng(seed)
-    m, d = 60, 5
-    X = rng.normal(size=(m, d))
-    ridge = 1e-5 * m
-    crit = Criterion([X], [1.0], ridge)
-
-    # 1: closed-form LOO == brute-force refit.
-    K = crit.gram(np.zeros(1))
-    L = np.linalg.cholesky(K + ridge * np.eye(m))
-    q = crit.loo(L)
-    brute = np.empty(m)
-    for i in range(m):
-        idx = np.arange(m) != i
-        M = K[np.ix_(idx, idx)] + ridge * np.eye(m - 1)
-        k_vec = K[idx, i]
-        brute[i] = K[i, i] - k_vec @ cho_solve(cho_factor(M, lower=True), k_vec)
-    assert np.allclose(brute, q, atol=1e-9, rtol=1e-7), np.abs(brute - q).max()
-
-    # 2: feasibility is free, at every bandwidth on the search range.
-    scan = [crit.terms(np.array([u])) for u in np.linspace(GRID_LO, GRID_HI, 41)]
-    assert all(0.0 <= t.tau <= 1.0 for t in scan), "q_i left [0, 1]"
-
-    # 3: tau* = max_i q_i solves the inner problem -- nothing smaller is feasible (some
-    # constraint q_i <= tau is violated), nothing larger scores as well.
-    t = crit.terms(np.zeros(1))
-    assert np.isclose(t.tau, q.max())
-    assert all((q > tau).any() for tau in (t.tau * 0.999, t.tau * 0.9)), "a smaller tau was feasible?"
-    assert all(np.log1p(-tau) < t.penalty for tau in t.tau + (1.0 - t.tau) * np.array([0.1, 0.5])), (
-        "a larger tau scored better?"
+    discover()
+    cls = REGISTRY[method]
+    cfg = load_config("task", task, return_only_subdict=False)
+    device = run_mod._device()
+    tm = TaskManager(
+        cfg,
+        task,
+        run_mod.BASE_CONFIG_PATH,
+        os.path.join(run_mod.BASE_DATA_PATH, task),
+        required_tensors=list(cls.tensors),
+        optional_tensors=list(cls.optional_tensors),
+        device=device,
+    )
+    dataset = tm.get_rollout_dataset(load_dataset_if_exists=False)
+    eval_cfg = build_cfg(cls, run_mod.BASE_CONFIG_PATH)
+    calib = dataset.get_subset(
+        subset="calibration",
+        required_tensors=list(cls.tensors),
+        optional_tensors=list(cls.optional_tensors),
+        required_actions=list(cls.actions),
+        optional_actions=list(cls.optional_actions),
+        normalize_tensors=eval_cfg.normalize_tensors,
+        with_success_labels=True,
+        history=0,
+        return_episode_lengths=True,
     )
 
-    # 4: opposite monotonicity, hence an interior optimum.
-    # Compared pairwise rather than through np.diff: the penalty is -inf at the smallest
-    # bandwidths (tau reaches 1 in double precision), and inf - inf is nan.
-    logdets = np.array([s.logdet for s in scan])
-    penalties = np.array([s.penalty for s in scan])
-    assert np.all(logdets[1:] <= logdets[:-1] + 1e-12), "log-det term is not decreasing in sigma"
-    assert np.all(penalties[1:] >= penalties[:-1] - 1e-12), "penalty term is not increasing in sigma"
-    objs = np.array([s.obj for s in scan])
-    best = int(np.argmax(objs))
-    assert 0 < best < len(objs) - 1, f"optimum at the edge of the search range (index {best})"
+    impl = cls()
+    impl.p = SimpleNamespace(lam=LAM, n_components=N_COMPONENTS, seed=seed)
+    impl.dataset, impl.device = dataset, device
+    impl._rng = np.random.default_rng(seed)
 
-    print(
-        f"criterion OK (m={m}): closed-form q == brute-force LOO (max diff "
-        f"{np.abs(brute - q).max():.2e}); q stays in [0, 1] over the whole search range "
-        f"(reaching 1 only in the sigma -> 0 limit, where the objective is -inf anyway, so "
-        f"tau < 1 never binds at any candidate worth considering); tau* = max_i q_i; "
-        f"log-det falls and the penalty rises with sigma, optimum interior at "
-        f"{np.exp(np.linspace(GRID_LO, GRID_HI, 41)[best]):.2f}x"
+    lengths = np.asarray(calib["episode_lengths"], int)
+    successful = np.asarray(calib["successful"], bool)
+    keep = np.repeat(successful, lengths)
+    # Episode id per surviving fit row -- the block structure the LOO score can be taken
+    # over. push_t's failed calibration episodes are dropped by `keep`, exactly as in fit().
+    episode = np.repeat(np.arange(len(lengths)), lengths)[keep]
+    obs = impl._obs(calib["obs_embeddings"])[keep]
+    sigma_o = impl._median(obs)
+    chunks = impl._chunks(calib["action_preds"])[torch.as_tensor(keep, device=device)]
+    parts = impl._fit_parts(chunks)
+    impl._fit_phi(parts)
+    if mult_phi != 1.0:  # same draw at a different bandwidth; see hyperparam_sensitivity
+        impl._sigma_phi *= mult_phi
+        impl._phi_W = impl._phi_W / mult_phi
+    mu = impl._embed(parts)
+    return Calibration(
+        task=task,
+        method=method,
+        seed=seed,
+        m=len(obs),
+        sigma_o=sigma_o,
+        sigma_phi=float(impl._sigma_phi),
+        sigma_A=impl._median(mu),
+        D_o=euclidean_distances(obs, obs, squared=True),
+        D_A=euclidean_distances(mu, mu, squared=True),
+        episode=episode,
     )
 
 
-# --------------------------------------------------------------------------- the optimiser
-@dataclass
-class TuneResult:
-    """What the tuner found, plus everything the report needs to explain it."""
+def cvar(scores: np.ndarray, alpha: float) -> tuple[float, float]:
+    """``(CVaR_alpha, tau)`` of the LOO scores, by sorting rather than by a solver.
 
-    mults: np.ndarray  # sigma_tuned / sigma_median, per block
-    best: Terms
-    ref: Terms  # the criterion at the median heuristic, i.e. what is being beaten
-    scan: pd.DataFrame
-    n_evals: int
-    at_edge: bool
-    labels: list[str] = field(default_factory=list)
-    #: label -> 1-D scan with the *other* bandwidths held at their tuned values. Taken from
-    #: the optimum rather than read off the nearest grid line, so the optimum lies on the
-    #: plotted curve by construction instead of hovering above it.
-    profiles: dict[str, pd.DataFrame] = field(default_factory=dict)
-
-
-def tune(crit: Criterion, labels: list[str], grid_n: int | None = None, polish: bool = True) -> TuneResult:
-    """Maximise the criterion over log-bandwidth multipliers: grid, then Nelder-Mead.
-
-    The grid is not an implementation detail that a smarter optimiser would remove -- it is
-    half the deliverable. A local method started at the median heuristic would report a
-    multiplier and nothing else; the grid says whether the objective is unimodal, how sharp
-    the optimum is, and how far the median heuristic sits from it, which is what decides
-    whether this criterion is worth anything. The polish then buys the last fraction of a
-    grid step so the reported multiplier is not quantised.
-
-    Cost is one Cholesky plus one triangular inverse per candidate, both ``O(m^3)``, on a
-    gram matrix that is never rebuilt from the raw features.
+    The Rockafellar-Uryasev objective ``tau + (1/(alpha n)) sum (q_i - tau)_+`` is convex
+    and piecewise linear in ``tau`` with kinks at the ``q_i``, so its minimum sits at the
+    ``(1-alpha)``-quantile and its value is the mean of the worst ``alpha n`` scores --
+    with the boundary score weighted fractionally when ``alpha n`` is not an integer.
+    :func:`check_cvar` verifies both statements against a brute-force minimisation.
     """
-    n = crit.n_blocks
-    if grid_n is None:
-        grid_n = GRID_N_1D if n == 1 else GRID_N_2D
-    axis = np.linspace(GRID_LO, GRID_HI, grid_n)
+    s = np.sort(scores)[::-1]
+    n = len(s)
+    k = int(np.floor(alpha * n))  # scores fully inside the tail
+    if k >= n:
+        return float(s.mean()), float(s[-1])
+    total = s[:k].sum() + (alpha * n - k) * s[k]
+    return float(total / (alpha * n)), float(s[k])
 
+
+def criterion_grid(cal: Calibration, alphas=ALPHAS, blocked: bool = False) -> pd.DataFrame:
+    """One row per grid cell: the logdet term, and ``(tau, CVaR)`` for every alpha."""
     rows = []
-    for u in itertools.product(*[axis] * n):
-        t = crit.terms(np.asarray(u))
-        row = {f"mult_{lab}": float(np.exp(ui)) for lab, ui in zip(labels, u)}
-        row.update(obj=t.obj, logdet=t.logdet, penalty=t.penalty, tau=t.tau)
-        row.update({f"sigma_{lab}": float(s) for lab, s in zip(labels, t.sigmas)})
-        rows.append(row)
-    scan = pd.DataFrame(rows)
+    for eo, mo in zip(EXPONENTS, MULTS):
+        for ea, ma in zip(EXPONENTS, MULTS):
+            logdet, loo = cal.cell(mo, ma, blocked=blocked)
+            row = {"exp_o": eo, "exp_A": ea, "mult_o": mo, "mult_A": ma, "logdet": logdet,
+                   "loo_mean": float(loo.mean()), "loo_max": float(loo.max())}
+            for a in alphas:
+                c, t = cvar(loo, a)
+                row[f"cvar@{a:g}"], row[f"tau@{a:g}"] = c, t
+            rows.append(row)
+    return pd.DataFrame(rows)
 
-    u_best = np.array(
-        [np.log(scan.loc[scan["obj"].idxmax(), f"mult_{lab}"]) for lab in labels], dtype=float
+
+def factor_grid(cal: Calibration) -> pd.DataFrame:
+    """The mean off-diagonal value of each kernel factor, per cell.
+
+    How much work a factor is doing, in one number, exactly as
+    ``hyperparam_sensitivity._mean_factor`` measures it. The kernel is a product, so a
+    factor averaging ~1 has been switched off: ``k = k_o * 1`` is the observation-only
+    baseline. That distinction is the whole difference between "the criterion balanced the
+    two bandwidths" and "the criterion deleted one of them", and TWA cannot tell them apart.
+    """
+    rows = []
+    for eo, mo in zip(EXPONENTS, MULTS):
+        for ea, ma in zip(EXPONENTS, MULTS):
+            rows.append({"exp_o": eo, "exp_A": ea,
+                         "k_o": _mean_off_diag(cal.D_o, mo * cal.sigma_o),
+                         "k_A": _mean_off_diag(cal.D_A, ma * cal.sigma_A)})
+    return pd.DataFrame(rows)
+
+
+def _mean_off_diag(D: np.ndarray, sigma: float, cap: int = 800) -> float:
+    """Mean off-diagonal ``exp(-D / 2 sigma^2)`` on (a capped corner of) the fit set."""
+    A = D[:cap, :cap]
+    n = len(A)
+    K = np.exp(-A / (2.0 * sigma**2))
+    return float((K.sum() - np.trace(K)) / (n * (n - 1)))
+
+
+def objective(grid: pd.DataFrame, alpha: float, beta: float) -> np.ndarray:
+    """``J(theta)`` over the whole grid, for one ``(alpha, beta)``.
+
+    ``1 - CVaR`` is clipped away from zero rather than allowed to produce ``-inf``: a
+    kernel whose worst tail scores are numerically 1 is maximally novelty-declaring, and
+    the barrier is meant to reject it, not to poison the comparison with a NaN.
+    """
+    slack = np.clip(1.0 - grid[f"cvar@{alpha:g}"].to_numpy(dtype=float), 1e-12, None)
+    return grid["logdet"].to_numpy(dtype=float) + beta * np.log(slack)
+
+
+def select(grid: pd.DataFrame, alpha: float, beta: float) -> pd.Series:
+    """The cell the criterion picks, with its criterion values attached."""
+    obj = objective(grid, alpha, beta)
+    row = grid.iloc[int(np.argmax(obj))].copy()
+    row["alpha"], row["beta"] = alpha, beta
+    row["objective"] = float(obj.max())
+    row["logdet_term"] = float(row["logdet"])
+    row["barrier_term"] = float(obj.max() - row["logdet"])
+    return row
+
+
+# ------------------------------------------------------------------------------- the checks
+def check_cvar(seed: int = 0) -> None:
+    """The sorting shortcut must reproduce the Rockafellar-Uryasev minimisation."""
+    rng = np.random.default_rng(seed)
+    for n in (97, 500):
+        q = rng.beta(2.0, 5.0, size=n)
+        for alpha in (0.03, 0.1, 0.37, 1.0):
+            c, tau = cvar(q, alpha)
+            taus = np.unique(np.concatenate([q, np.linspace(0, 1, 20001)]))
+            ru = taus + np.maximum(q[None, :] - taus[:, None], 0).sum(axis=1) / (alpha * n)
+            assert abs(ru.min() - c) < 1e-9, f"CVaR mismatch at n={n}, alpha={alpha}: {ru.min()} vs {c}"
+            assert abs(taus[int(np.argmin(ru))] - tau) < 1e-3 or abs(ru[np.argmin(np.abs(taus - tau))] - c) < 1e-9, (
+                f"tau is not the RU minimiser at n={n}, alpha={alpha}"
+            )
+    print("CVaR OK: sorting reproduces min_tau [tau + (1/alpha n) sum (q-tau)_+] and its argmin")
+
+
+def check_grid(cal: Calibration) -> None:
+    """The cheap grid's cell at 1x must reproduce an ordinary ``fit()`` of the method.
+
+    Everything downstream rests on the claim that a cell of :meth:`Calibration.cell` is the
+    kernel the method would actually have fitted, so that claim is checked against the
+    method rather than assumed: refit ``kern_cd`` through its own code path at the median
+    heuristic and compare the leave-one-out scores it produces.
+    """
+    logdet, loo = cal.cell(1.0, 1.0)
+    err = float(np.abs(np.sort(loo) - np.sort(_refit_loo(cal))).max())
+    assert err < 1e-6, f"cheap grid LOO scores differ from {cal.method}.fit by {err:.2e}"
+    print(f"grid OK: LOO scores at 1x match {cal.method}.fit to {err:.1e}; (1/m) logdet = {logdet:.4f}")
+
+
+def check_block_loo(cal: Calibration, max_m: int = 700) -> None:
+    """Leave-one-episode-out, closed form, must equal refitting with the episode deleted."""
+    if cal.m > max_m:
+        print(f"block-LOO check skipped: m = {cal.m} > {max_m} (the brute force is O(m^3) per episode)")
+        return
+    mult_o, mult_A = 0.5, 2.0  # off the median heuristic, so no factor is accidentally 1
+    _, fast = cal.cell(mult_o, mult_A, blocked=True)
+    K = np.exp(-0.5 * (cal.D_o / (mult_o * cal.sigma_o) ** 2 + cal.D_A / (mult_A * cal.sigma_A) ** 2))
+    lam_m = LAM * cal.m
+    brute = np.empty(cal.m)
+    for b in np.unique(cal.episode):
+        idx = np.flatnonzero(cal.episode == b)
+        out = np.flatnonzero(cal.episode != b)
+        M = K[np.ix_(out, out)] + lam_m * np.eye(len(out))
+        brute[idx] = np.diag(K[np.ix_(idx, idx)] - K[np.ix_(idx, out)] @ np.linalg.solve(M, K[np.ix_(out, idx)]))
+    err = float(np.abs(fast - brute).max())
+    assert err < 1e-6, f"block-LOO closed form differs from the brute-force refit by {err:.2e}"
+    _, point = cal.cell(mult_o, mult_A)
+    print(f"block-LOO OK: matches refitting with the episode deleted to {err:.1e}; "
+          f"over {len(np.unique(cal.episode))} episodes the median score rises "
+          f"{np.median(point):.4f} -> {np.median(fast):.4f}")
+
+
+def _refit_loo(cal: Calibration) -> np.ndarray:
+    """LOO scores from the method's own ``fit``, for :func:`check_grid`."""
+    from shared_utils.hydra_utils import load_config
+    from tasks import TaskManager
+
+    cls = REGISTRY[cal.method]
+    cfg = load_config("task", cal.task, return_only_subdict=False)
+    device = run_mod._device()
+    tm = TaskManager(
+        cfg, cal.task, run_mod.BASE_CONFIG_PATH, os.path.join(run_mod.BASE_DATA_PATH, cal.task),
+        required_tensors=list(cls.tensors), optional_tensors=list(cls.optional_tensors), device=device,
     )
-    if polish:
-        res = minimize(
-            lambda u: -crit.terms(u).obj,
-            u_best,
-            method="Nelder-Mead",
-            options=dict(xatol=1e-3, fatol=1e-7, maxiter=200 * n),
-        )
-        if np.isfinite(res.fun) and -res.fun >= scan["obj"].max():
-            u_best = np.asarray(res.x, dtype=float)
-
-    best = crit.terms(u_best)
-
-    profiles = {}
-    for k, lab in enumerate(labels):
-        rows = []
-        for ui in np.append(axis, u_best[k]):
-            u = u_best.copy()
-            u[k] = ui
-            t = crit.terms(u)
-            rows.append(dict(mult=float(np.exp(ui)), obj=t.obj, logdet=t.logdet, penalty=t.penalty, tau=t.tau))
-        profiles[lab] = pd.DataFrame(rows).sort_values("mult").reset_index(drop=True)
-
-    return TuneResult(
-        mults=np.exp(u_best),
-        best=best,
-        ref=crit.terms(np.zeros(n)),
-        scan=scan,
-        n_evals=crit.n_evals,
-        at_edge=bool(np.any(u_best <= GRID_LO + 1e-9) or np.any(u_best >= GRID_HI - 1e-9)),
-        labels=list(labels),
-        profiles=profiles,
+    dataset = tm.get_rollout_dataset(load_dataset_if_exists=False)
+    eval_cfg = build_cfg(cls, run_mod.BASE_CONFIG_PATH)
+    calib = dataset.get_subset(
+        subset="calibration", required_tensors=list(cls.tensors), optional_tensors=list(cls.optional_tensors),
+        required_actions=list(cls.actions), optional_actions=list(cls.optional_actions),
+        normalize_tensors=eval_cfg.normalize_tensors, with_success_labels=True, history=0,
+        return_episode_lengths=True,
     )
+    impl = cls()
+    impl.p = SimpleNamespace(lam=LAM, n_components=N_COMPONENTS, seed=cal.seed)
+    impl.dataset, impl.device = dataset, device
+    impl.fit(calib)
+    return impl.loo_scores
 
 
-# ----------------------------------------------------------------------------- the variant
-class _LogDetMixin:
-    """Replaces the median heuristic for ``sigma_o`` (and ``sigma_A``) with the criterion.
+# --------------------------------------------------------------- the TWA landscape (arms)
+class _ScaleMixin:
+    """Scales sigma_o and sigma_A by fixed multiples of their median heuristic.
 
-    ``_pack`` is the hinge: ``KernCDMethod.fit`` calls it once, after both bandwidths are
-    fixed and before anything consumes them, and ``_features`` calls it again on every
-    scoring pass. So the first call -- always the fit set -- tunes and installs, and every
-    later call sees the installed values. The median heuristic still runs first and its
-    output is kept as ``_sigma_o_median`` / ``_sigma_A_median``: it is the reference point
-    the multipliers are measured against, and the initialisation the polish starts from.
+    ``_pack`` is the one place where both bandwidths are known and neither has been used
+    yet; it is also called on every scoring pass, so the scaling is guarded to happen once.
     """
 
-    #: ``lam * m * logdet_ridge_scale``. The default matches the ridge ``KernCD`` actually
-    #: puts on the diagonal, so the criterion's ``K + lam I`` is the matrix that gets
-    #: factored and its ``q_i`` are the estimator's own LOO scores rather than a proxy.
-    logdet_ridge_scale = 1.0
-    logdet_grid_n: int | None = None
-    logdet_polish = True
+    ldk_mult_o = 1.0
+    ldk_mult_A = 1.0
 
-    def _pack(self, obs: np.ndarray, mu: np.ndarray | None) -> np.ndarray:
-        if not getattr(self, "_logdet_done", False):
-            self._logdet_tune(obs, mu)
-            self._logdet_done = True
+    def _pack(self, obs, mu):
+        if not getattr(self, "_ldk_done", False):
+            self._ldk_done = True
+            self._sigma_o = float(self._sigma_o) * float(self.ldk_mult_o)
+            if mu is not None:
+                self._sigma_A = float(self._sigma_A) * float(self.ldk_mult_A)
         return super()._pack(obs, mu)
 
-    def _logdet_tune(self, obs: np.ndarray, mu: np.ndarray | None) -> None:
-        self._sigma_o_median = float(self._sigma_o)
-        blocks, sigmas, labels = [obs], [self._sigma_o], ["o"]
-        if mu is not None:
-            self._sigma_A_median = float(self._sigma_A)
-            blocks.append(mu)
-            sigmas.append(self._sigma_A)
-            labels.append("A")
 
-        ridge = float(self.p.lam) * len(obs) * self.logdet_ridge_scale
-        crit = Criterion(blocks, sigmas, ridge)
-        res = tune(crit, labels, grid_n=self.logdet_grid_n, polish=self.logdet_polish)
-        self._logdet_result = res
-        self._logdet_ridge = ridge
-
-        self._sigma_o = float(res.best.sigmas[0])
-        if mu is not None:
-            self._sigma_A = float(res.best.sigmas[1])
+def arm_name(method: str, exp_o: float, exp_A: float) -> str:
+    """Registry key and cache key, in octaves off the median heuristic."""
+    return f"ldk_{method.removeprefix('kern_cd_')}__o{exp_o:+g}__A{exp_A:+g}"
 
 
-def make_variant(base_name: str) -> type[KernCDMethod]:
-    """Register (once) the log-det-tuned twin of a registered kern_cd method."""
-    name = base_name + SUFFIX
+def make_arm(method: str, exp_o: float, exp_A: float):
+    """Register (once) the variant class for one grid cell."""
+    name = arm_name(method, exp_o, exp_A)
     if name in REGISTRY:
         return REGISTRY[name]
-    base = REGISTRY[base_name]
-    cls = type(base.__name__ + "LogDet", (_LogDetMixin, base), {"name": name})
-    cls.__doc__ = f"{base_name} with bandwidths tuned by the log-det criterion."
-    return cls
+    base = REGISTRY[method]
+    return type(
+        "Cell" + name.replace("ldk_", "").replace("__", "_").replace("+", "p").replace("-", "m").replace(".", "d"),
+        (_ScaleMixin, base),
+        {"name": name, "params": dict(base.params, lam=LAM, n_components=N_COMPONENTS),
+         "ldk_mult_o": 2.0**exp_o, "ldk_mult_A": 2.0**exp_A},
+    )
 
 
-# ------------------------------------------------------------------------- the sweep
-#: Bandwidth multipliers scored end-to-end by the FIPER pipeline, sqrt(2) apart over the
-#: same [1/8, 8] the criterion searches.
-SWEEP_MULTS = (0.125, 0.177, 0.25, 0.354, 0.5, 0.707, 1.0, 1.414, 2.0, 2.828, 4.0, 5.657, 8.0)
+def headline(df: pd.DataFrame, quantile: float | None = None) -> pd.Series:
+    """The headline metrics at ``paper_table.py``'s footing: quantile-averaged, best cell.
 
+    ``TWA_gridmean`` -- the flat mean over all 510 (style, quantile, window) rows -- rides
+    along because the headline is an argmax over 51 noisy numbers and can move on its own.
 
-class _FixedMultMixin:
-    """Scales ``sigma_o`` by a fixed multiple of the median heuristic. The control arm.
-
-    "The criterion did not improve TWA" has two very different explanations -- the criterion
-    picks a bad bandwidth, or TWA does not care about the bandwidth -- and the tuned-vs-median
-    comparison cannot separate them, because it only ever evaluates two points on the axis.
-    Scoring the whole axis end-to-end does: it shows the shape of TWA as a function of the
-    bandwidth, where the median heuristic sits on it, where the criterion moved to, and what
-    the best attainable value would have been.
+    Passing ``quantile`` restricts to one of FIPER's conformal quantiles instead of
+    averaging over all ten. That is how the criterion's own ``tau`` enters: ``tau`` is by
+    construction the ``(1-alpha)``-quantile of the LOO scores, and FIPER's thresholds are
+    quantiles of those same scores, so "reuse ``tau`` as the threshold" *is* "keep only the
+    ``1-alpha`` column of the quantile grid".
     """
-
-    logdet_mult = 1.0
-
-    def _pack(self, obs: np.ndarray, mu: np.ndarray | None) -> np.ndarray:
-        if not getattr(self, "_mult_done", False):
-            self._sigma_o_median = float(self._sigma_o)
-            self._sigma_o = float(self._sigma_o) * float(self.logdet_mult)
-            self._mult_done = True
-        return super()._pack(obs, mu)
-
-
-def sweep_name(base_name: str, mult: float) -> str:
-    return f"{base_name}_x{mult:g}"
-
-
-def make_sweep_variant(base_name: str, mult: float) -> type[KernCDMethod]:
-    name = sweep_name(base_name, mult)
-    if name in REGISTRY:
-        return REGISTRY[name]
-    base = REGISTRY[base_name]
-    cls = type(f"{base.__name__}X{str(mult).replace('.', '_')}", (_FixedMultMixin, base),
-               {"name": name, "logdet_mult": float(mult)})
-    cls.__doc__ = f"{base_name} with sigma_o fixed at {mult}x the median heuristic."
-    return cls
-
-
-# --------------------------------------------------------------------------- the reporting
-def grid(name: str, task: str, results: dict) -> pd.DataFrame:
-    """The full (threshold style x quantile x window) metric grid for one method."""
-    return pd.DataFrame(run_mod._rows(name, task, results))
-
-
-def headline(df: pd.DataFrame) -> pd.Series:
-    """The number the paper table reports: best (window, threshold) by quantile-averaged TWA.
-
-    ``my_methods/paper_table.py`` averages over quantiles and then picks the best window and
-    threshold style by TWA, so that is what a change has to move to matter. ``TWA_gridmean``
-    -- the flat mean over all 510 configurations -- is reported beside it because the
-    headline is an argmax over 51 noisy numbers and can move on its own; the grid mean
-    cannot.
-    """
+    if quantile is not None:
+        df = df[np.isclose(df["Quantile"], quantile)]
+        if df.empty:
+            return pd.Series(dict.fromkeys(
+                ["TWA", "Accuracy", "Det. Time", "TWA_gridmean", "Window", "Threshold"], np.nan))
     avg = df.groupby(["Threshold", "Window"], as_index=False)[["TWA", "Accuracy", "Det. Time"]].mean()
     best = avg.loc[avg["TWA"].idxmax()]
-    return pd.Series(
-        {
-            "TWA": best["TWA"],
-            "Accuracy": best["Accuracy"],
-            "Det. Time": best["Det. Time"],
-            "Threshold": best["Threshold"],
-            "Window": best["Window"],
-            "TWA_gridmax": df["TWA"].max(),
-            "TWA_gridmean": df["TWA"].mean(),
-        }
-    )
+    return pd.Series({
+        "TWA": float(best["TWA"]),
+        "Accuracy": float(best["Accuracy"]),
+        "Det. Time": float(best["Det. Time"]),
+        "TWA_gridmean": float(df["TWA"].mean()),
+        "Window": best["Window"],
+        "Threshold": best["Threshold"],
+    })
 
 
-def report_tuning(task: str, impls: dict) -> None:
-    """What the criterion chose, what it was worth, and whether it measured the right thing."""
-    print(f"\n=== log-det criterion, {task} ===")
-    for name, impl in impls.items():
-        res = getattr(impl, "_logdet_result", None)
-        fitted = objective_at_fit(impl)
-        m = len(impl.model.data)
-        gap = loo_check(impl)
-        print(f"\n-- {name}   (m = {m} fit steps, ridge lam*m = {impl.model.lam_ * m:.3g})")
-        print(f"  criterion's q_i vs the method's loo_scores: max rel diff {gap:.2e}")
-        assert gap < 1e-6, f"{name}: the criterion is not evaluating kern_cd's own LOO scores"
-        if res is None:
-            print("  bandwidths (median heuristic)   " + ", ".join(f"{s:.4g}" for s in fitted.sigmas))
-            print(f"  objective at those bandwidths   {fitted.obj:+.4f}  "
-                  f"= logdet/n {fitted.logdet:+.4f}  +  log(1-tau) {fitted.penalty:+.4f}   (tau {fitted.tau:.4g})")
-            continue
-        for lab, mult, sig in zip(res.labels, res.mults, res.best.sigmas):
-            median = getattr(impl, f"_sigma_{lab}_median")
-            print(f"  sigma_{lab}: median {median:.4g}  ->  tuned {sig:.4g}   ({mult:.3f}x)")
-        print(f"  objective   median {res.ref.obj:+.4f}  ->  tuned {res.best.obj:+.4f}   "
-              f"({res.best.obj - res.ref.obj:+.4f})")
-        print(f"    logdet/n  {res.ref.logdet:+.4f}  ->  {res.best.logdet:+.4f}")
-        print(f"    log(1-tau){res.ref.penalty:+.4f}  ->  {res.best.penalty:+.4f}   "
-              f"(tau {res.ref.tau:.4g} -> {res.best.tau:.4g})")
-        print(f"  {res.n_evals} criterion evaluations" + ("   [WARNING: optimum at the search edge]" if res.at_edge else ""))
-        assert abs(fitted.obj - res.best.obj) < 1e-6, "the fitted model is not at the tuned bandwidths"
+def _cache_path(task: str, name: str, seed: int) -> str:
+    return str(CACHE_DIR / f"{task}__{name}__seed{seed}.csv")
 
 
-def report_loo_shift(task: str, impls: dict) -> None:
-    """How the calibration scores move -- one of the two channels to the metrics.
+def twa_landscape(task: str, method: str, seed: int, force: bool = False,
+                  cache_only: bool = False, group: int = GROUP) -> dict:
+    """Every cell's full (style, quantile, window) metric grid, evaluated end to end.
 
-    The other is the test scores, which the base variant's LOO comparison does not have:
-    unlike a change of LOO rule, a change of bandwidth moves the score function itself, so
-    both the thresholds and the numbers they are compared against shift.
+    The raw grids are kept rather than reduced on the spot: the headline reduction averages
+    over the ten conformal quantiles, and the ``tau``-as-threshold variant needs one of them
+    on its own.
     """
-    print(f"\n=== calibration (LOO) score distribution, {task} ===")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    discover()
+    cells = [(eo, ea) for eo in EXPONENTS for ea in EXPONENTS]
+    have, todo = {}, []
+    for eo, ea in cells:
+        path = _cache_path(task, arm_name(method, eo, ea), seed)
+        if os.path.exists(path) and not force:
+            have[(eo, ea)] = pd.read_csv(path)
+        else:
+            todo.append((eo, ea))
+
+    if todo and not cache_only:
+        print(f"\nevaluating {len(todo)} cell(s) of the TWA landscape on {task} "
+              f"({len(have)} cached) ...")
+        started = time.time()
+        for i in range(0, len(todo), group):
+            batch = todo[i : i + group]
+            if not _evaluate_group(task, method, seed, batch, have):
+                for cell in batch:  # one bad cell should not cost the group
+                    _evaluate_group(task, method, seed, [cell], have)
+            print(f"  {min(i + group, len(todo))}/{len(todo)} cells, {time.time() - started:.0f}s elapsed")
+    return have
+
+
+def reduce_landscape(cells: dict, quantile: float | None = None) -> pd.DataFrame:
+    """The headline metrics of every cell, as one row per grid point."""
     rows = []
-    for name, impl in impls.items():
-        s = np.asarray(impl.loo_scores)
-        rows.append({"method": name, "min": s.min(), "q10": np.quantile(s, 0.10), "median": np.median(s),
-                     "q90": np.quantile(s, 0.90), "q95": np.quantile(s, 0.95), "max": s.max()})
-    print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.4g}"))
-
-
-def report_ridge_sensitivity(impls: dict, scales=(0.01, 0.1, 1.0, 10.0, 100.0)) -> None:
-    """Does the answer depend on the one number the criterion does not pin down?
-
-    ``specs/methods.md`` fixes ``lam = 1e-5`` for the *estimator*, where the matrix factored
-    is ``K + lam*m*I``; the criterion's ``lam`` is written as an absolute ridge and is a free
-    knob. This re-tunes at several multiples of the estimator's ridge, on the already-built
-    distance matrices, and prints the multiplier each one picks. A criterion whose optimum
-    swings with a knob nobody has a principled value for is not a criterion.
-    """
-    tuned = {n: i for n, i in impls.items() if hasattr(i, "_logdet_result")}
-    if not tuned:
-        return
-    print("\n=== ridge sensitivity: the criterion's lam is a free knob ===")
-    rows = []
-    for name, impl in tuned.items():
-        res = impl._logdet_result
-        blocks = [impl._logdet_obs] + ([impl._logdet_mu] if impl._logdet_mu is not None else [])
-        sigmas = [getattr(impl, f"_sigma_{lab}_median") for lab in res.labels]
-        for scale in scales:
-            ridge = float(impl.p.lam) * len(blocks[0]) * scale
-            crit = Criterion(blocks, sigmas, ridge)
-            r = tune(crit, res.labels, polish=True)
-            row = {"method": name, "ridge / (lam*m)": scale, "ridge": ridge, "obj": r.best.obj, "tau": r.best.tau}
-            row.update({f"mult_{lab}": mult for lab, mult in zip(res.labels, r.mults)})
+    for eo in EXPONENTS:
+        for ea in EXPONENTS:
+            row = {"exp_o": eo, "exp_A": ea, "mult_o": 2.0**eo, "mult_A": 2.0**ea}
+            df = cells.get((eo, ea))
+            row.update(headline(df, quantile).to_dict() if df is not None
+                       else dict.fromkeys(["TWA", "Accuracy", "Det. Time", "TWA_gridmean"], np.nan))
             rows.append(row)
-    print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+    return pd.DataFrame(rows)
 
 
-def report_tau_robustness(impls: dict, quantiles=(1.0, 0.999, 0.99, 0.95)) -> None:
-    """How much of the criterion's answer rests on a single fit point.
+def _evaluate_group(task: str, method: str, seed: int, group: list, have: dict) -> bool:
+    names = []
+    for eo, ea in group:
+        make_arm(method, eo, ea)
+        names.append(arm_name(method, eo, ea))
+    try:
+        results = run_mod._evaluate_task(names, task, seed, {})
+    except Exception as exc:  # noqa: BLE001 -- a cell that cannot be evaluated is a result
+        print(f"  !! {names if len(names) > 1 else names[0]} failed: "
+              f"{type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return False
+    for (eo, ea), name in zip(group, names):
+        df = pd.DataFrame(run_mod._rows(name, task, results))
+        df.to_csv(_cache_path(task, name, seed), index=False)
+        have[(eo, ea)] = df
+    return True
 
-    ``tau`` upper-bounds *every* ``q_i``, so it is a maximum over the fit set and the penalty
-    term is a function of one point -- the most isolated step in the calibration split. That
-    is a design choice with consequences: a single outlying step (a rollout's first frame,
-    an unusual grasp) sets the bandwidth for all m of them. Re-tuning with ``tau`` taken as a
-    high quantile of ``q`` instead measures the exposure. A multiplier that barely moves says
-    the maximum is representative; one that jumps says the criterion is fitting an outlier.
 
-    Nothing here changes the criterion under test -- the tuned methods all use the specified
-    ``tau = max_i q_i``. This is a diagnostic on it.
-    """
-    tuned = {n: i for n, i in impls.items() if hasattr(i, "_logdet_result")}
-    if not tuned:
-        return
-    print("\n=== tau robustness: the penalty term is a maximum over the fit set ===")
+# ------------------------------------------------------------------------------ reporting
+def merge(crit: pd.DataFrame, twa: pd.DataFrame) -> pd.DataFrame:
+    """Criterion values and headline metrics on one row per cell."""
+    return crit.merge(twa.drop(columns=["mult_o", "mult_A"]), on=["exp_o", "exp_A"], how="left")
+
+
+def _cell(df: pd.DataFrame, exp_o: float, exp_A: float) -> pd.Series:
+    return df[(df["exp_o"] == exp_o) & (df["exp_A"] == exp_A)].iloc[0]
+
+
+def sweep(df: pd.DataFrame, alphas=ALPHAS, betas=BETAS) -> pd.DataFrame:
+    """What each ``(alpha, beta)`` picks, and what that pick scores."""
     rows = []
-    for name, impl in tuned.items():
-        res = impl._logdet_result
-        blocks = [impl._logdet_obs] + ([impl._logdet_mu] if impl._logdet_mu is not None else [])
-        sigmas = [getattr(impl, f"_sigma_{lab}_median") for lab in res.labels]
-        for q in quantiles:
-            crit = Criterion(blocks, sigmas, impl._logdet_ridge, tau_q=q)
-            r = tune(crit, res.labels, polish=True)
-            row = {"method": name, "tau": "max" if q >= 1.0 else f"q{q:g}", "tau_value": r.best.tau,
-                   "obj": r.best.obj}
-            row.update({f"mult_{lab}": mult for lab, mult in zip(res.labels, r.mults)})
-            rows.append(row)
-    print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+    for a in alphas:
+        for b in betas:
+            pick = select(df, a, b)
+            rows.append({
+                "alpha": a, "beta": b,
+                "exp_o": pick["exp_o"], "exp_A": pick["exp_A"],
+                "mult_o": pick["mult_o"], "mult_A": pick["mult_A"],
+                "logdet": pick["logdet"], "cvar": pick[f"cvar@{a:g}"], "tau": pick[f"tau@{a:g}"],
+                "k_o": pick.get("k_o", np.nan), "k_A": pick.get("k_A", np.nan),
+                "TWA": pick.get("TWA", np.nan), "Accuracy": pick.get("Accuracy", np.nan),
+                "Det. Time": pick.get("Det. Time", np.nan), "TWA_gridmean": pick.get("TWA_gridmean", np.nan),
+            })
+    return pd.DataFrame(rows)
 
 
-# ------------------------------------------------------------------------------- the plot
-#: Three series, one axis, same units (nats). Slots 1-3 of the categorical palette already
-#: validated for this repo in ``my_experiments/profiling/profiling.py``; re-checked here for this
-#: subset (worst adjacent CVD dE 9.2 deutan, normal-vision 27.6, light surface #fcfcfb).
-_COLORS = {"objective": "#2a78d6", "logdet": "#eb6834", "penalty": "#1baf7a"}
-_INK, _MUTED, _GRID = "#0b0b0b", "#52514e", "#e6e5e0"
+def report_landscape(df: pd.DataFrame, cal: Calibration) -> dict:
+    """Print the grid's extent, and return its two reference cells: median heuristic, best TWA."""
+    med = _cell(df, 0.0, 0.0)
+    best = df.loc[df["TWA"].idxmax()]
+    print(f"\n=== {cal.method} on {cal.task}, seed {cal.seed}: the grid ===")
+    print(f"  fit set m = {cal.m};  median heuristic  sigma_o {cal.sigma_o:.4g}  "
+          f"sigma_phi {cal.sigma_phi:.4g}  sigma_A {cal.sigma_A:.4g}")
+    print(f"  grid: {len(EXPONENTS)} x {len(EXPONENTS)} = {len(df)} cells, "
+          f"2^{EXPONENTS[0]:g} .. 2^{EXPONENTS[-1]:g} x the median heuristic in half-octaves")
+    print(f"  (1/m) logdet term over the grid: {df['logdet'].min():.3f} .. {df['logdet'].max():.3f}")
+    print(f"  headline TWA over the grid:      {df['TWA'].min():.3f} .. {df['TWA'].max():.3f}   "
+          f"(median {df['TWA'].median():.3f})")
+    print(f"  median heuristic cell (1x, 1x):  TWA {med['TWA']:.3f}   Accuracy {med['Accuracy']:.3f}   "
+          f"Det. Time {med['Det. Time']:.3f}")
+    print(f"  best cell in the grid:           TWA {best['TWA']:.3f}   at sigma_o {best['mult_o']:g}x, "
+          f"sigma_A {best['mult_A']:g}x")
+    return {"median": med, "best": best}
 
 
-def _label_indices(series: list[np.ndarray], avoid: tuple[int, ...] = (), halo: int = 2) -> list[int]:
-    """One direct-label anchor per curve: each where it is furthest from everything else.
-
-    Two of these three curves converge at large bandwidth (once ``tau -> 0`` the penalty
-    vanishes and the objective *is* the log-det term), so a fixed anchor -- the right end,
-    the maximum, anywhere -- collides. Each candidate x is scored by the vertical gap to the
-    nearest other curve, in axis-normalised units, and anchors are assigned greedily,
-    best-separated curve first.
-
-    Two constraints then apply, and they are deliberately unequal in strength. Anchors must
-    be **distinct**, at least ``halo`` apart: two labels at one x overlap no matter how far
-    apart their curves are, so that one is never relaxed -- an exhausted curve takes the
-    x furthest from every anchor already placed. Staying clear of the axis edges and of the
-    fixed annotations (the ``avoid`` positions) only shapes the preference, because a label
-    a little close to a dashed reference line is still readable.
-    """
-    stack = np.vstack(series)
-    span = np.ptp(stack[np.isfinite(stack)]) or 1.0
-    n = stack.shape[1]
-    lo, hi = int(0.15 * n), max(int(0.15 * n) + 1, int(0.85 * n))
-
-    preference = []
-    for i in range(len(series)):
-        g = np.min(np.abs(stack - series[i]) / span + np.eye(len(series))[:, i, None] * 1e9, axis=0)
-        g = np.nan_to_num(g, nan=0.0)
-        g[:lo] = g[hi:] = 0.0
-        for a in avoid:
-            g[max(0, a - halo) : a + halo + 1] = 0.0
-        preference.append(g)
-
-    out = [0] * len(series)
-    taken: list[int] = []
-    for i in sorted(range(len(series)), key=lambda k: -preference[k].max()):
-        free = np.array([j for j in range(n) if all(abs(j - t) > halo for t in taken)])
-        if not len(free):  # more labels than the axis can hold; nothing sensible is left
-            free = np.arange(n)
-        score = preference[i][free]
-        # Every preferred position is taken: fall back to the x furthest from the anchors
-        # already placed, which keeps the labels apart even when it cannot keep them clear.
-        j = int(free[np.argmax(score)]) if score.max() > 0 else int(
-            free[np.argmax([min(abs(int(j) - t) for t in taken) if taken else 0 for j in free])]
-        )
-        out[i] = j
-        taken.append(j)
+def report_alpha(df: pd.DataFrame, med: pd.Series) -> pd.DataFrame:
+    """The alpha sweep at beta = 1, as the spec asks for it first."""
+    out = sweep(df, betas=(1.0,))
+    print("\n=== alpha sweep at beta = 1 ===")
+    print("  (what the criterion picks, and what that pick actually scores; k_A is the mean "
+          "off-diagonal\n   action factor, so k_A ~ 1 means the action channel is inert)")
+    show = out[["alpha", "mult_o", "mult_A", "logdet", "cvar", "tau", "k_A", "TWA", "Accuracy", "Det. Time"]]
+    print(show.to_string(index=False, float_format=lambda v: f"{v:.4f}", na_rep="  --  "))
+    print(f"  median heuristic, for reference: mult_o 1, mult_A 1, TWA {med['TWA']:.4f}")
     return out
 
 
-def _plot_surface(ax, res: TuneResult, fig) -> None:
-    """The objective over both bandwidth multipliers: one sequential hue, light -> dark.
+def report_beta(df: pd.DataFrame, med: pd.Series, alpha: float) -> pd.DataFrame:
+    """The beta sweep, at the tail fraction fixed in advance (see ``ALPHA_DEFAULT``)."""
+    out = sweep(df, alphas=(alpha,))
+    print(f"\n=== beta sweep at alpha = {alpha:g} ===")
+    show = out[["beta", "mult_o", "mult_A", "logdet", "cvar", "tau", "k_A", "TWA", "Accuracy", "Det. Time"]]
+    print(show.to_string(index=False, float_format=lambda v: f"{v:.4f}", na_rep="  --  "))
+    print(f"  median heuristic, for reference: mult_o 1, mult_A 1, TWA {med['TWA']:.4f}")
+    return out
 
-    Whether the optimum is a point or a diagonal ridge is the whole question for the
-    action-channel methods, and it is a property of the surface that no profile shows. The
-    colour range is clipped to the top 10 nats -- below that the penalty term is diverging
-    and every candidate is equally worthless -- and the clip is named on the colour bar.
+
+def report_balance(df: pd.DataFrame, alpha: float) -> dict:
+    """How large the two terms are relative to each other, and at what beta they match.
+
+    ``beta`` is the only thing setting the exchange rate between a log-determinant and a
+    log-slack, and neither is scale-free: the logdet term carries the data's dimension and
+    conditioning, the barrier carries how novel the fit set already looks under the median
+    heuristic. So the ``beta`` at which the two terms are comparable is a property of the
+    task, and if it moves across tasks then no single ``beta`` -- 1 included -- can be the
+    right setting everywhere. That is a claim about the criterion, not about tuning it, so
+    it is measured rather than inferred from the sweeps.
     """
-    x_lab, y_lab = res.labels
-    piv = res.scan.pivot_table(index=f"mult_{y_lab}", columns=f"mult_{x_lab}", values="obj")
-    X, Y, Z = piv.columns.to_numpy(), piv.index.to_numpy(), piv.to_numpy()
-    top = np.nanmax(Z[np.isfinite(Z)])
-    # Clipped rather than left to render as "no data": below the floor the penalty term is
-    # diverging and every candidate is equally worthless, which is a value, not a gap.
-    Z = np.maximum(np.nan_to_num(Z, nan=-np.inf), top - 10.0)
+    logdet = df["logdet"].to_numpy(float)
+    barrier = np.log(np.clip(1.0 - df[f"cvar@{alpha:g}"].to_numpy(float), 1e-12, None))
+    med_l, med_b = float(np.median(np.abs(logdet))), float(np.median(np.abs(barrier)))
+    out = {
+        "median |logdet term|": med_l,
+        "median |barrier| at beta=1": med_b,
+        "beta that makes them equal": med_l / med_b if med_b else np.inf,
+        "cells where the barrier is <10% of the logdet at beta=1":
+            float(np.mean(np.abs(barrier) < 0.1 * np.abs(logdet))),
+    }
+    print(f"\n=== how the two terms compare (alpha = {alpha:g}) ===")
+    for k, v in out.items():
+        print(f"  {k:<58} {v:.3f}")
+    return out
 
-    mesh = ax.pcolormesh(X, Y, Z, cmap="Blues", vmin=top - 10.0, vmax=top, shading="nearest")
-    ax.contour(X, Y, Z, levels=np.linspace(top - 8, top, 5), colors="#fcfcfb", linewidths=0.8, alpha=0.8)
-    bar = fig.colorbar(mesh, ax=ax, pad=0.02)
-    bar.set_label("objective (nats, clipped 10 below the optimum)", color=_MUTED, fontsize=9)
-    bar.ax.tick_params(colors=_MUTED, labelsize=8)
+
+def report_proxy(df: pd.DataFrame, alphas=ALPHAS, betas=BETAS) -> pd.DataFrame:
+    """Is the criterion a useful proxy for TWA at all?
+
+    A tuning criterion is only worth anything if cells it likes are cells that score well,
+    so the rank correlation between ``J(theta)`` and TWA over the 289 cells is reported for
+    every ``(alpha, beta)``. This is a much stronger statement than the argmax alone: the
+    argmax is one cell out of 289 and can land well by luck.
+    """
+    from scipy.stats import spearmanr
+
+    ok = df["TWA"].notna().to_numpy()
+    rows = []
+    for a in alphas:
+        for b in betas:
+            obj = objective(df, a, b)[ok]
+            rho = float(spearmanr(obj, df["TWA"].to_numpy()[ok]).statistic)
+            rows.append({"alpha": a, "beta": b, "spearman": rho})
+    out = pd.DataFrame(rows)
+    print("\n=== rank correlation between the criterion and headline TWA, over all cells ===")
+    print(out.pivot(index="alpha", columns="beta", values="spearman").to_string(
+        float_format=lambda v: f"{v:+.3f}"))
+    best = out.loc[out["spearman"].idxmax()]
+    print(f"  best: alpha {best['alpha']:g}, beta {best['beta']:g} -> rho {best['spearman']:+.3f};  "
+          f"logdet alone -> rho {spearmanr(df['logdet'].to_numpy()[ok], df['TWA'].to_numpy()[ok]).statistic:+.3f}")
+    return out
+
+
+def report_tau(crit: pd.DataFrame, cells: dict, alpha: float, beta: float) -> pd.DataFrame | None:
+    """Reuse ``tau`` as the classification threshold instead of averaging over quantiles.
+
+    ``tau`` is the ``(1-alpha)``-quantile of the LOO scores and FIPER's conformal thresholds
+    are quantiles of exactly those scores, so this is not a new threshold rule at all -- it
+    is the instruction to keep the ``1-alpha`` column of the quantile grid rather than the
+    mean over all ten. Whether it helps is then a question about the quantile grid, and the
+    median heuristic is scored the same way so the two differ only in the bandwidths.
+    """
+    q = round(1.0 - alpha, 4)
+    df_q = merge(crit, reduce_landscape(cells, quantile=q))
+    if df_q["TWA"].isna().all():
+        print(f"\n=== tau as the threshold: alpha = {alpha:g} needs quantile {q:g}, which is not "
+              f"in FIPER's grid -- skipped ===")
+        return None
+    med_q, pick_q = _cell(df_q, 0.0, 0.0), select(df_q, alpha, beta)
+    print(f"\n=== tau as the threshold (quantile {q:g} only, not the 10-quantile average) ===")
+    out = pd.DataFrame([
+        {"rule": "median heuristic", "mult_o": 1.0, "mult_A": 1.0, "TWA": med_q["TWA"],
+         "Accuracy": med_q["Accuracy"], "Det. Time": med_q["Det. Time"]},
+        {"rule": f"criterion (alpha={alpha:g}, beta={beta:g})", "mult_o": pick_q["mult_o"],
+         "mult_A": pick_q["mult_A"], "TWA": pick_q["TWA"], "Accuracy": pick_q["Accuracy"],
+         "Det. Time": pick_q["Det. Time"]},
+    ])
+    print(out.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    return df_q
+
+
+def summary_row(task: str, method: str, seed: int, kind: str, label: str, cell: pd.Series) -> dict:
+    """One row of the summary table. ``kind`` is the machine-readable key the plots filter on."""
+    return {
+        "Task": task, "Method": method, "Seed": seed, "Kind": kind, "Rule": label,
+        "sigma_o (x med)": float(cell["mult_o"]), "sigma_A (x med)": float(cell["mult_A"]),
+        "k_A": float(cell.get("k_A", np.nan)),
+        "TWA": float(cell["TWA"]), "Accuracy": float(cell["Accuracy"]),
+        "Det. Time": float(cell["Det. Time"]), "TWA_gridmean": float(cell["TWA_gridmean"]),
+    }
+
+
+# ---------------------------------------------------------------------------------- plots
+# Repo house style: near-white surface, near-black ink, muted labels. Magnitude gets a
+# single-hue sequential ramp; a signed quantity gets a two-hue diverging ramp with a
+# neutral midpoint.
+_INK, _MUTED, _GRID, _SURFACE = "#0b0b0b", "#52514e", "#e6e5e0", "#fcfcfb"
+# Three categorical hues, checked with the dataviz skill's validator against this
+# surface: all-pairs CVD dE 9.2 (deutan) and normal-vision dE 23.8, both above floor.
+_ACCENT, _SECOND, _THIRD = "#eb6834", "#2b6cb0", "#1baf7a"
+
+
+def _style(ax):
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(_GRID)
+    ax.tick_params(colors=_MUTED, labelsize=8)
+
+
+def _save(fig, stem: str) -> None:
+    for ext in ("png", "pdf"):
+        fig.savefig(HERE / f"{stem}.{ext}", dpi=150, facecolor=_SURFACE, bbox_inches="tight")
+    print(f"  plot -> {os.path.relpath(HERE / (stem + '.png'), ROOT_DIR)} (+ .pdf)")
+
+
+def _field(ax, df: pd.DataFrame, values: np.ndarray, cmap: str, label: str,
+           floor_pct: float | None = None):
+    """One (sigma_o, sigma_A) landscape as a mesh in log2 coordinates.
+
+    ``floor_pct`` clips the bottom of the colour range at that percentile. The criterion
+    needs it: its barrier term dives to -12 in the corner where every fit point looks
+    novel, and a range stretched to that swamps the structure around the maximum, which is
+    the only part of the surface an argmax rule ever visits.
+    """
+    piv = df.assign(_v=values).pivot(index="exp_A", columns="exp_o", values="_v")
+    X, Y, Z = piv.columns.to_numpy(float), piv.index.to_numpy(float), piv.to_numpy(float)
+    kw = {} if floor_pct is None else {"vmin": float(np.nanpercentile(Z, floor_pct))}
+    mesh = ax.pcolormesh(X, Y, Z, cmap=cmap, shading="nearest", **kw)
+    bar = ax.figure.colorbar(mesh, ax=ax, pad=0.02, fraction=0.046)
+    bar.set_label(label, color=_MUTED, fontsize=8)
+    bar.ax.tick_params(colors=_MUTED, labelsize=7)
     bar.outline.set_visible(False)
-
-    # Both labels sit on top of the colour ramp, whose dark end is far too dark for ink
-    # text, so they carry the surface colour behind them rather than relying on the cell.
-    plate = dict(boxstyle="round,pad=0.25", facecolor="#fcfcfb", edgecolor="none", alpha=0.85)
-    ax.plot([1.0], [1.0], "o", ms=8, color="#fcfcfb", mec=_INK, mew=1.5, zorder=4)
-    ax.annotate("median heuristic", (1.0, 1.0), textcoords="offset points", xytext=(0, 13),
-                color=_INK, fontsize=9, ha="center", zorder=5, bbox=plate)
-    ax.plot([res.mults[0]], [res.mults[1]], "o", ms=8, color=_COLORS["objective"], mec="#fcfcfb", mew=2, zorder=4)
-    ax.annotate(f"optimum {res.mults[0]:.2f}x, {res.mults[1]:.2f}x", (res.mults[0], res.mults[1]),
-                textcoords="offset points", xytext=(0, -18), color=_INK, fontsize=9,
-                ha="center", va="top", zorder=5, bbox=plate)
-
-    ax.set_xscale("log", base=2)
-    ax.set_yscale("log", base=2)
-    ax.set_xlabel(f"$\\sigma_{x_lab}$ / median heuristic", color=_MUTED, fontsize=9)
-    ax.set_ylabel(f"$\\sigma_{y_lab}$ / median heuristic", color=_MUTED, fontsize=9)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(_GRID)
-    ax.tick_params(colors=_MUTED, labelsize=9)
+    ticks = [e for e in EXPONENTS if e == int(e)]
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
+    ax.set_xticklabels([f"{2.0**e:g}" for e in ticks])
+    ax.set_yticklabels([f"{2.0**e:g}" for e in ticks])
+    ax.set_xlabel(r"$\sigma_o$  ($\times$ median heuristic)", color=_MUTED, fontsize=9)
+    ax.set_ylabel(r"$\sigma_A$  ($\times$ median heuristic)", color=_MUTED, fontsize=9)
+    _style(ax)
+    return mesh
 
 
-def plot_landscape(res: TuneResult, task: str, name: str, path: str) -> None:
-    """The objective and its two terms against each bandwidth, through the optimum.
+def _marks(ax, picks: list[tuple[float, float, str, str, str]]):
+    """Overlay the reference points every landscape shares."""
+    for x, y, marker, color, label in picks:
+        ax.plot(x, y, marker, color=color, markersize=11, markeredgewidth=2.0,
+                markerfacecolor="none" if marker in ("o", "s") else color, label=label, zorder=5)
 
-    One panel per bandwidth: that bandwidth varies, the other is held at its tuned value.
-    With two bandwidths a third panel draws the surface itself, because the profiles cannot
-    answer the question the action-channel methods raise -- whether the two bandwidths have
-    genuinely different optima or the objective only sees some combination of them, in which
-    case the "second bandwidth" is not a second degree of freedom at all.
 
-    The x-range is trimmed to where the objective is within 10 nats of its maximum, and the
-    trimming is stated on the axis label. Outside it the penalty term diverges and the
-    optimum's neighbourhood -- the only region where the median heuristic and the criterion
-    can be told apart -- is compressed to a point. The untrimmed scan is in the CSV beside
-    this file.
+def plot_landscape(df: pd.DataFrame, cal: Calibration, alpha: float, beta: float, stem: str) -> None:
+    """The criterion's landscape beside the TWA landscape it is standing in for.
+
+    The whole question is whether the argmax of the left panel lands where the right panel
+    is high. Both panels carry the same three marks -- the median heuristic, the
+    criterion's pick, the grid's best TWA -- so the comparison is a matter of looking at
+    where the marks sit rather than of reading two colour bars against each other.
     """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    labels = res.labels
-    n_panels = len(labels) + (1 if len(labels) == 2 else 0)
-    fig, axes = plt.subplots(1, n_panels, figsize=(6.2 * n_panels, 4.4), squeeze=False)
-    for ax, lab in zip(axes[0], labels):
-        prof = res.profiles[lab]
-        prof = prof[prof["obj"] >= prof["obj"].max() - 10.0]
-        x = prof["mult"].to_numpy()
-
-        # Short text on the curve, the formula in the legend: a direct label has to fit in
-        # the gap between two curves, and a rendered fraction does not.
-        drawn = [
-            ("logdet", prof["logdet"].to_numpy(), "log-det", r"$\frac{1}{n}\log\det(K+\lambda I)$"),
-            ("penalty", prof["penalty"].to_numpy(), "penalty", r"$\log(1-\tau)$"),
-            ("objective", prof["obj"].to_numpy(), "objective", "objective (their sum)"),
-        ]
-        for key, series, _, legend in drawn:
-            ax.plot(x, series, color=_COLORS[key], lw=2.0, label=legend, zorder=3 if key == "objective" else 2)
-        mult = float(res.mults[labels.index(lab)])
-        anchors = _label_indices(
-            [s for _, s, _, _ in drawn],
-            avoid=(int(np.abs(x - mult).argmin()), int(np.abs(x - 1.0).argmin())),
-        )
-        for (key, series, label, _), j in zip(drawn, anchors):
-            # Centred text runs off the axes when the anchor is near an edge, so the label
-            # hangs inward from there instead.
-            side = "left" if j < 0.25 * len(x) else ("right" if j > 0.75 * len(x) else "center")
-            ax.annotate(label, (x[j], series[j]), textcoords="offset points",
-                        xytext=({"left": -4, "center": 0, "right": 4}[side], 9),
-                        color=_MUTED, fontsize=9, ha=side, zorder=5)
-
-        ax.axvline(1.0, color="#b3b2a8", lw=1.2, ls=(0, (4, 3)), zorder=1)
-        ax.annotate("median heuristic", (1.0, 1.0), xycoords=("data", "axes fraction"),
-                    textcoords="offset points", xytext=(5, -11), color=_MUTED, fontsize=9, ha="left")
-        ax.plot([mult], [res.best.obj], "o", ms=8, color=_COLORS["objective"], mec="#fcfcfb", mew=2, zorder=4)
-        ax.annotate(f"optimum {mult:.2f}x", (mult, res.best.obj), textcoords="offset points", xytext=(0, -16),
-                    color=_INK, fontsize=9, ha="center", va="top", zorder=5)
-
-        ax.set_xscale("log", base=2)
-        ax.set_xlabel(f"$\\sigma_{lab}$ / median heuristic   (range trimmed to within 10 nats of the optimum)",
-                      color=_MUTED, fontsize=9)
-        ax.set_ylabel("nats", color=_MUTED, fontsize=9)
-        ax.grid(True, color=_GRID, lw=0.8, zorder=0)
-        ax.set_axisbelow(True)
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        for side in ("left", "bottom"):
-            ax.spines[side].set_color(_GRID)
-        ax.tick_params(colors=_MUTED, labelsize=9)
-        ax.margins(x=0.05, y=0.12)
-        # "best" rather than a fixed corner: the curves fill a different part of the panel
-        # for every method and task, and the direct labels have already claimed the gaps.
-        ax.legend(loc="best", frameon=False, fontsize=9, labelcolor=_MUTED)
-
-    if len(labels) == 2:
-        _plot_surface(axes[0][-1], res, fig)
-
-    fig.suptitle(f"log-det criterion vs bandwidth -- {name} on {task}", color=_INK, fontsize=12, x=0.02, ha="left")
-    fig.tight_layout(rect=(0, 0, 1.0, 0.95))
-    fig.savefig(path, dpi=150, facecolor="#fcfcfb")
-    plt.close(fig)
-    print(f"  landscape plot -> {os.path.relpath(path, ROOT_DIR)}")
-
-
-def plot_sweep(df: pd.DataFrame, task: str, name: str, mult_logdet: float | None, path: str) -> None:
-    """TWA as a function of the bandwidth, with the two candidate bandwidths marked.
-
-    Two series on one axis because both are TWA in the same units: the headline (an argmax
-    over 51 window/threshold configurations, which is what the paper table reports) and the
-    flat mean over all 510 (no selection, so it moves only when the method genuinely got
-    better everywhere).
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(7.4, 4.6))
-    x = df["mult"].to_numpy()
-    drawn = [
-        ("objective", df["TWA"].to_numpy(), "headline TWA"),
-        ("logdet", df["TWA_gridmean"].to_numpy(), "grid-mean TWA"),
-    ]
-    for key, y, label in drawn:
-        ax.plot(x, y, color=_COLORS[key], lw=2.0, marker="o", ms=5, label=label)
-    anchors = _label_indices([y for _, y, _ in drawn],
-                             avoid=tuple(int(np.abs(x - v).argmin()) for v in (1.0, mult_logdet or 1.0)))
-    for (key, y, label), j in zip(drawn, anchors):
-        side = "left" if j < 0.25 * len(x) else ("right" if j > 0.75 * len(x) else "center")
-        ax.annotate(label, (x[j], y[j]), textcoords="offset points",
-                    xytext=({"left": -4, "center": 0, "right": 4}[side], 10),
-                    color=_MUTED, fontsize=9, ha=side, zorder=5)
-
-    for mult, text, colour in ((1.0, "median heuristic", "#b3b2a8"),
-                               (mult_logdet, "log-det criterion", _COLORS["penalty"])):
-        if mult is None:
-            continue
-        ax.axvline(mult, color=colour, lw=1.4, ls=(0, (4, 3)), zorder=1)
-        ax.annotate(text, (mult, 1.0), xycoords=("data", "axes fraction"), textcoords="offset points",
-                    xytext=(5, -11), color=_MUTED, fontsize=9, ha="left", zorder=5)
-
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("$\\sigma_o$ / median heuristic", color=_MUTED, fontsize=9)
-    # The whole point of the chart is how *little* TWA moves, and a zoomed axis argues the
-    # opposite, so the zoom is named on the axis rather than left for the reader to notice.
-    ax.set_ylabel(f"TWA (axis zoomed to {df['TWA_gridmean'].min():.2f}-{df['TWA'].max():.2f}; "
-                  "the metric runs 0-1)", color=_MUTED, fontsize=9)
-    ax.grid(True, color=_GRID, lw=0.8, zorder=0)
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(_GRID)
-    ax.tick_params(colors=_MUTED, labelsize=9)
-    ax.margins(x=0.05, y=0.18)
-    ax.legend(loc="lower left", frameon=False, fontsize=9, labelcolor=_MUTED)
-    fig.suptitle(f"TWA vs observation bandwidth -- {name} on {task}", color=_INK, fontsize=12, x=0.02, ha="left")
-    fig.tight_layout(rect=(0, 0, 1.0, 0.95))
-    fig.savefig(path, dpi=150, facecolor="#fcfcfb")
-    plt.close(fig)
-    print(f"  sweep plot -> {os.path.relpath(path, ROOT_DIR)}")
-
-
-# --------------------------------------------------------------------------------- the run
-#: ``_evaluate_task`` returns metrics, not the method objects, and the objects hold the
-#: fitted state this experiment is about (bandwidths, the scan, the LOO scores). The adapter
-#: builds them inside ``EvaluationManager``, so they are captured on the way past rather
-#: than plumbed through my_methods/ -- which stays untouched.
-_LAST_IMPLS: dict = {}
-
-
-def _install_impl_capture() -> None:
-    import my_methods.base as base_mod
-
-    original = base_mod.make_eval_class
-
-    def patched(method_cls, params):
-        cls = original(method_cls, params)
-        original_init = cls.__init__
-
-        def __init__(self, *a, **kw):
-            original_init(self, *a, **kw)
-            _LAST_IMPLS[method_cls.name] = self.impl
-
-        cls.__init__ = __init__
-        return cls
-
-    base_mod.make_eval_class = patched
-    run_mod.make_eval_class = patched
-
-
-def _keep_tuning_inputs() -> None:
-    """Retain the fit-set blocks on the impl, so the ridge sweep can re-tune without refitting.
-
-    ``_pack`` is handed exactly the two arrays the criterion needs and then drops them. They
-    are ``[m, d_o]`` and ``[m, 128]`` -- 2 MB at the largest task -- so keeping them is far
-    cheaper than a second evaluation pass.
-    """
-    original = _LogDetMixin._logdet_tune
-
-    def patched(self, obs, mu):
-        self._logdet_obs, self._logdet_mu = obs, mu
-        return original(self, obs, mu)
-
-    _LogDetMixin._logdet_tune = patched
-
-
-def summarise(seed: int | None = None) -> int:
-    """Roll every cached (task, method) pair up into the paper table's footing.
-
-    Every cached seed of a cell is averaged, and the seed-to-seed spread of the *delta* is
-    printed separately for the cells that have more than one. That second table is not
-    decoration: on the smallest task one action method's delta is -0.070 at seed 0 and
-    +0.025 / +0.028 at seeds 1 and 2, which is a sign flip of the same size as the effect
-    being measured. A single-seed cell on a small task carries no information about the
-    criterion at all.
-    """
-    pattern = "*__seed*.csv" if seed is None else f"*__seed{seed}.csv"
-    files = sorted(f for f in pathlib.Path(CACHE_DIR).glob(pattern) if "__sweep__" not in f.name)
-    if not files:
-        print(f"no cached grids in {CACHE_DIR}", file=sys.stderr)
-        return 1
-
-    grids: dict[tuple[str, str, int], pd.DataFrame] = {}
-    for f in files:
-        task, name, tail = f.name.rsplit("__", 2)
-        grids[(task, name, int(tail.removeprefix("seed").removesuffix(".csv")))] = pd.read_csv(f)
-
-    tasks = [t for t in run_mod.ALL_TASKS if any(k[0] == t for k in grids)]
-    bases = [n for n in ("kern_cd_obs", "kern_cd_disp", "kern_cd_sig", "kern_cd_flat", "kern_cd_sum")
-             if any(k[1] == n for k in grids)]
-
-    for label, get in (
-        ("headline TWA (best window+threshold, quantile-averaged)", lambda g: float(headline(g)["TWA"])),
-        ("grid-mean TWA (all 510 configs, no selection)", lambda g: float(g["TWA"].mean())),
-    ):
-        cells: dict[tuple[str, str], list[float]] = {}
-        med_rows, ld_rows, n_seeds = [], [], []
-        for base_name in bases:
-            med_row, ld_row = {"Method": base_name}, {"Method": base_name}
-            for task in tasks:
-                seeds = sorted(s for (t, n, s) in grids if t == task and n == base_name
-                               and (task, base_name + SUFFIX, s) in grids)
-                if not seeds:
-                    continue
-                med = [get(grids[(task, base_name, s)]) for s in seeds]
-                ld = [get(grids[(task, base_name + SUFFIX, s)]) for s in seeds]
-                med_row[task], ld_row[task] = float(np.mean(med)), float(np.mean(ld))
-                cells[(base_name, task)] = [b - a for a, b in zip(med, ld)]
-                n_seeds.append((base_name, task, len(seeds)))
-            med_rows.append(med_row)
-            ld_rows.append(ld_row)
-        med_df = pd.DataFrame(med_rows).set_index("Method")
-        ld_df = pd.DataFrame(ld_rows).set_index("Method")
-        cols = [t for t in tasks if t in med_df.columns and t in ld_df.columns]
-        delta = ld_df[cols] - med_df[cols]
-        delta["MEAN_d"] = delta[cols].mean(axis=1)
-        delta["mean_median"] = med_df[cols].mean(axis=1)
-        delta["mean_logdet"] = ld_df[cols].mean(axis=1)
-
-        print(f"\n=== {label} ===")
-        print("  cells are log-det-tuned minus median-heuristic, averaged over the cached seeds;\n"
-              "  mean_* are the task-averaged levels\n")
-        print(delta.to_string(float_format=lambda v: f"{v:+.4f}", na_rep="  --  "))
-        arr = delta[cols].to_numpy(dtype=float)
-        n = int(np.isfinite(arr).sum())
-        print(f"\n  log-det better in {int(np.nansum(arr > 0))}/{n} (task, method) cells; "
-              f"mean delta {np.nanmean(arr):+.4f}")
-
-        multi = {k: v for k, v in cells.items() if len(v) > 1}
-        if multi:
-            print("\n  per-seed deltas where more than one seed is cached:")
-            for (base_name, task), vals in sorted(multi.items()):
-                print(f"    {base_name:<14} {task:<11} " + "  ".join(f"{v:+.4f}" for v in vals)
-                      + f"   (spread {max(vals) - min(vals):.4f})")
-    return 0
-
-
-def run_sweep(task: str, base_name: str, seed: int, force: bool, plot: bool = True) -> int:
-    """Score the whole bandwidth axis end-to-end, and place both candidates on it.
-
-    All 15 arms -- the 13 fixed multipliers, the median-heuristic method itself and the
-    log-det-tuned one -- go through a single ``_evaluate_task`` call, so the processed
-    dataset is built once and every arm sees byte-identical data. Only ``sigma_o`` is swept:
-    for an action-channel method the axis is a plane and 169 end-to-end evaluations is a
-    different experiment.
-    """
-    path = os.path.join(CACHE_DIR, f"{task}__{base_name}__sweep__seed{seed}.csv")
-    if os.path.exists(path) and not force:
-        df = pd.read_csv(path)
-        mult_logdet = float(df["mult_logdet"].iloc[0]) if "mult_logdet" in df else None
-    else:
-        make_variant(base_name)
-        arms = [(m, sweep_name(base_name, m)) for m in SWEEP_MULTS]
-        for mult, _ in arms:
-            make_sweep_variant(base_name, mult)
-        names = [n for _, n in arms] + [base_name, base_name + SUFFIX]
-        _install_impl_capture()
-        print(f"\nsweeping sigma_o over {len(SWEEP_MULTS)} multipliers on {task} "
-              f"({len(names)} arms in one dataset build) ...")
-        results = run_mod._evaluate_task(names, task, seed, {})
-        impls = dict(_LAST_IMPLS)
-
-        rows = []
-        for mult, n in arms:
-            h = headline(grid(n, task, results))
-            rows.append(dict(mult=mult, TWA=float(h["TWA"]), Accuracy=float(h["Accuracy"]),
-                             det_time=float(h["Det. Time"]), TWA_gridmean=float(h["TWA_gridmean"]),
-                             sigma_o=float(impls[n]._sigma_o)))
-        df = pd.DataFrame(rows).sort_values("mult")
-        mult_logdet = float(impls[base_name + SUFFIX]._logdet_result.mults[0])
-        # Carried in the CSV, not just returned: the plot needs it on a cached re-run and
-        # re-deriving it would mean refitting the method.
-        df["mult_logdet"] = mult_logdet
-        df.to_csv(path, index=False)
-        # Both reference arms are in the same run, so their rows are exact rather than
-        # interpolated off the swept grid.
-        for label, n in (("median heuristic (1.00x)", base_name), (f"log-det ({mult_logdet:.2f}x)",
-                                                                   base_name + SUFFIX)):
-            h = headline(grid(n, task, results))
-            print(f"  {label:<28} TWA {float(h['TWA']):.4f}   grid-mean {float(h['TWA_gridmean']):.4f}")
-
-    print(f"\n=== TWA vs sigma_o, {base_name} on {task} (seed {seed}) ===")
-    print(df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    pick = select(df, alpha, beta)
     best = df.loc[df["TWA"].idxmax()]
-    at_one = df.loc[(df["mult"] - 1.0).abs().idxmin()]
-    print(f"\n  best swept multiplier {best['mult']:.3g}x: TWA {best['TWA']:.4f}   "
-          f"(at the median heuristic: {at_one['TWA']:.4f}; headroom {best['TWA'] - at_one['TWA']:+.4f})")
-    if plot:
-        plot_sweep(df, task, base_name, mult_logdet,
-                   str(HERE / f"{task}__{base_name}__sweep.png"))
-    return 0
+    marks = [
+        (0.0, 0.0, "X", _INK, "median heuristic"),
+        (pick["exp_o"], pick["exp_A"], "o", _ACCENT, rf"criterion ($\alpha$={alpha:g}, $\beta$={beta:g})"),
+        (best["exp_o"], best["exp_A"], "s", _SECOND, "best TWA in the grid"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.9))
+    _field(axes[0], df, df["logdet"].to_numpy(float), "Blues", r"$n^{-1}\log\det(K_\theta+\lambda I)$")
+    axes[0].set_title(r"the log-determinant term alone", color=_INK, fontsize=11, loc="left")
+    _field(axes[1], df, objective(df, alpha, beta), "Blues", r"$J(\theta)$", floor_pct=20.0)
+    axes[1].set_title(rf"the criterion  ($\alpha$={alpha:g}, $\beta$={beta:g})",
+                      color=_INK, fontsize=11, loc="left")
+    _field(axes[2], df, df["TWA"].to_numpy(float), "Greens", "TWA")
+    axes[2].set_title("what it is standing in for", color=_INK, fontsize=11, loc="left")
+    for ax in axes:
+        _marks(ax, marks)
+
+    caption = textwrap.wrap(
+        f"{len(df)} cells; both bandwidths swept over 2^{EXPONENTS[0]:g}..2^{EXPONENTS[-1]:g} times "
+        f"their median heuristic, sigma_phi left at it. Headline TWA at the median heuristic "
+        f"{_cell(df, 0, 0)['TWA']:.3f}, at the criterion's pick {pick['TWA']:.3f}, at the best cell "
+        f"in the grid {best['TWA']:.3f}. The middle panel's colour range is clipped below its 20th "
+        f"percentile, so the structure near the maximum survives the barrier's dive.", width=104)
+    fig.tight_layout(rect=(0, 0, 1, 0.85 - 0.028 * len(caption)), w_pad=3.0)
+    fig.text(0.005, 0.99, f"Where the criterion looks, and where TWA actually is  --  "
+                          f"{cal.method} on {cal.task}", color=_INK, fontsize=13, ha="left", va="top")
+    fig.text(0.005, 0.93, "\n".join(caption), color=_MUTED, fontsize=9.5, ha="left", va="top",
+             linespacing=1.5)
+    # One legend for all three panels, in the header band: inside a panel there is no corner
+    # that is free of a mark on every task.
+    leg = fig.legend(*axes[0].get_legend_handles_labels(), loc="upper right",
+                     bbox_to_anchor=(0.995, 1.0), fontsize=9, framealpha=0.0, ncol=1,
+                     labelcolor=_MUTED)
+    leg.set_frame_on(False)
+    _save(fig, stem)
+    plt.close(fig)
+
+
+def plot_sweeps(df: pd.DataFrame, cal: Calibration, alpha_star: float, stem: str) -> None:
+    """What the two knobs move: the bandwidths picked, and the TWA that follows.
+
+    Bandwidths and TWA are different measures on different scales, so they get their own
+    panels rather than a second y-axis. The median heuristic is the horizontal reference in
+    both rows; on the TWA row the grid's best and worst cells bound what any rule could
+    have achieved on this grid.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    a_sweep = sweep(df, betas=(1.0,)).sort_values("alpha")
+    b_sweep = sweep(df, alphas=(alpha_star,)).sort_values("beta")
+    med, best = _cell(df, 0.0, 0.0), df.loc[df["TWA"].idxmax()]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 6.6), sharex="col")
+    for col, (data, key, title) in enumerate([
+        (a_sweep, "alpha", r"tail fraction $\alpha$   ($\beta = 1$)"),
+        (b_sweep, "beta", rf"barrier weight $\beta$   ($\alpha = {alpha_star:g}$)"),
+    ]):
+        x = data[key].to_numpy(float)
+        top, bot = axes[0, col], axes[1, col]
+        top.axhline(0.0, color=_GRID, lw=1.5, zorder=1)
+        top.plot(x, np.log2(data["mult_o"]), "-o", color=_ACCENT, lw=2, ms=5, label=r"$\sigma_o$")
+        top.plot(x, np.log2(data["mult_A"]), "-s", color=_SECOND, lw=2, ms=5, label=r"$\sigma_A$")
+        top.set_xscale("log")
+        top.set_yticks([e for e in EXPONENTS if e == int(e)])
+        top.set_yticklabels([f"{2.0**e:g}x" for e in EXPONENTS if e == int(e)])
+        top.set_ylim(min(EXPONENTS) - 0.4, max(EXPONENTS) + 0.4)
+        top.set_ylabel("bandwidth picked\n" + r"($\times$ median heuristic; the 1x rule is the line)",
+                       color=_MUTED, fontsize=9)
+        top.set_title(title, color=_INK, fontsize=11, loc="left")
+        _style(top)
+        if col == 0:
+            leg = top.legend(loc="lower left", fontsize=9, framealpha=0.92, facecolor=_SURFACE,
+                             edgecolor=_GRID, labelcolor=_MUTED, ncol=2)
+            leg.get_frame().set_linewidth(0.8)
+
+        bot.axhspan(df["TWA"].min(), df["TWA"].max(), color=_GRID, alpha=0.55, lw=0,
+                    label="range over the grid")
+        bot.axhline(med["TWA"], color=_INK, lw=1.6, ls="--", label="median heuristic")
+        bot.axhline(best["TWA"], color=_SECOND, lw=1.6, ls=":", label="best cell in the grid")
+        bot.plot(x, data["TWA"], "-o", color=_ACCENT, lw=2, ms=5, label="the criterion's pick")
+        bot.set_xscale("log")
+        bot.set_xticks(x)
+        bot.set_xticklabels([f"{v:g}" for v in x])
+        bot.set_xlabel(r"$\beta$" if key == "beta" else r"$\alpha$", color=_MUTED, fontsize=9)
+        bot.set_ylabel("headline TWA", color=_MUTED, fontsize=9)
+        _style(bot)
+        if col == 0:
+            leg = bot.legend(loc="lower left", fontsize=8, framealpha=0.92, facecolor=_SURFACE,
+                             edgecolor=_GRID, labelcolor=_MUTED, ncol=2)
+            leg.get_frame().set_linewidth(0.8)
+
+    fig.suptitle(f"What the criterion's two knobs actually move  --  {cal.method} on {cal.task}",
+                 color=_INK, fontsize=13, x=0.01, ha="left", y=1.0)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    _save(fig, stem)
+    plt.close(fig)
+
+
+def plot_proxy(df: pd.DataFrame, cal: Calibration, alpha: float, beta: float, stem: str) -> None:
+    """Criterion against TWA, cell by cell: does liking a kernel predict scoring well?"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy.stats import spearmanr
+
+    ok = df["TWA"].notna().to_numpy()
+    obj, twa = objective(df, alpha, beta)[ok], df["TWA"].to_numpy(float)[ok]
+    rho = float(spearmanr(obj, twa).statistic)
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    sc = ax.scatter(obj, twa, c=df["exp_A"].to_numpy(float)[ok], cmap="Blues", s=26,
+                    edgecolors=_SURFACE, linewidths=0.6, zorder=3)
+    bar = fig.colorbar(sc, ax=ax, pad=0.02)
+    bar.set_label(r"$\sigma_A$ ($\log_2$ of the multiplier)", color=_MUTED, fontsize=8)
+    bar.ax.tick_params(colors=_MUTED, labelsize=7)
+    bar.outline.set_visible(False)
+    med = _cell(df, 0.0, 0.0)
+    ax.axhline(med["TWA"], color=_INK, lw=1.4, ls="--", zorder=2)
+    ax.text(obj.min(), med["TWA"], " median heuristic", color=_MUTED, fontsize=8, va="bottom")
+    pick = select(df, alpha, beta)
+    ax.plot(pick["objective"], pick["TWA"], "o", color=_ACCENT, ms=12, markerfacecolor="none",
+            markeredgewidth=2.0, zorder=4)
+    ax.annotate("the criterion's pick", (pick["objective"], pick["TWA"]), textcoords="offset points",
+                xytext=(-18, 14), ha="right", color=_ACCENT, fontsize=8.5, zorder=6,
+                bbox={"facecolor": _SURFACE, "edgecolor": "none", "alpha": 0.85, "pad": 1.5},
+                arrowprops={"arrowstyle": "-", "color": _ACCENT, "lw": 1.0, "shrinkB": 8})
+    ax.set_xlabel(rf"$J(\theta)$   ($\alpha$={alpha:g}, $\beta$={beta:g})", color=_MUTED, fontsize=9)
+    ax.set_ylabel("headline TWA", color=_MUTED, fontsize=9)
+    _style(ax)
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
+    fig.text(0.005, 0.99, f"Does liking a kernel predict scoring well?   Spearman $\\rho$ = {rho:+.2f}",
+             color=_INK, fontsize=12, ha="left", va="top")
+    fig.text(0.005, 0.92, f"{int(ok.sum())} cells, {cal.method} on {cal.task}. A criterion worth "
+                          "tuning with has to rank kernels the way TWA does.",
+             color=_MUTED, fontsize=8.5, ha="left", va="top")
+    _save(fig, stem)
+    plt.close(fig)
+
+
+def plot_across_tasks(summary: pd.DataFrame, alpha: float, stem: str) -> None:
+    """The study in one figure: which bandwidths each rule picks, and what that costs.
+
+    Top, one bandwidth plane per task, in multiples of that task's median heuristic -- so
+    the median heuristic is the origin everywhere by construction and the arrow is exactly
+    the move the criterion makes. One panel per task rather than one shared scatter: the
+    grid is discrete and the picks genuinely coincide across tasks, so a shared scatter
+    cannot label its own marks. Bottom, the headline TWA those moves buy, as displacements
+    from the median heuristic -- the summary table's numbers, direct-labelled.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    tasks = list(dict.fromkeys(summary["Task"]))
+    kinds = [("criterion", rf"criterion ($\alpha$={alpha:g}, $\beta$=1)", _ACCENT, "o"),
+             ("criterion_best", "criterion, best knobs (oracle)", _THIRD, "^"),
+             ("oracle", "best bandwidths in the grid (oracle)", _SECOND, "s")]
+    by = {(r["Task"], r["Kind"]): r for _, r in summary.iterrows()}
+
+    fig = plt.figure(figsize=(2.55 * len(tasks) + 0.6, 7.0))
+    gs = fig.add_gridspec(2, len(tasks), height_ratios=[1.25, 1], top=0.78, bottom=0.08,
+                          left=0.06, right=0.98, hspace=0.30, wspace=0.18)
+    # Every second octave: at 8.5pt, "0.0625 0.125 0.25" do not fit side by side.
+    ticks = [e for e in EXPONENTS if e == int(e) and int(e) % 2 == 0]
+    for j, task in enumerate(tasks):
+        ax = fig.add_subplot(gs[0, j])
+        ax.axhline(0, color=_GRID, lw=1.2, zorder=1)
+        ax.axvline(0, color=_GRID, lw=1.2, zorder=1)
+        for kind, label, color, marker in kinds:
+            row = by.get((task, kind))
+            if row is None:
+                continue
+            x, y = np.log2(row["sigma_o (x med)"]), np.log2(row["sigma_A (x med)"])
+            if kind == "criterion":  # the move the criterion makes, drawn as the move it is
+                ax.annotate("", (x, y), (0, 0), arrowprops={
+                    "arrowstyle": "->", "color": color, "lw": 1.4, "alpha": 0.55, "shrinkA": 7})
+            ax.plot(x, y, marker, color=color, ms=9, markerfacecolor="none", markeredgewidth=2.0,
+                    label=label, zorder=4)
+        ax.plot(0, 0, "X", color=_INK, ms=12, label="median heuristic", zorder=5)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        ax.set_xticklabels([f"{2.0**e:g}" for e in ticks])
+        ax.set_yticklabels([f"{2.0**e:g}" for e in ticks] if j == 0 else [])
+        ax.set_xlim(min(EXPONENTS) - 0.5, max(EXPONENTS) + 0.5)
+        ax.set_ylim(min(EXPONENTS) - 0.5, max(EXPONENTS) + 0.5)
+        ax.set_aspect("equal")
+        ax.set_xlabel(r"$\sigma_o$  ($\times$ median)", color=_MUTED, fontsize=8.5)
+        if j == 0:
+            ax.set_ylabel(r"$\sigma_A$  ($\times$ median heuristic)", color=_MUTED, fontsize=9)
+        ax.set_title(task, color=_INK, fontsize=10.5, loc="left")
+        _style(ax)
+        if j == 0:
+            handles, labels_ = ax.get_legend_handles_labels()
+
+    ax = fig.add_subplot(gs[1, :])
+    height, y0 = 0.26, np.arange(len(tasks))
+    for i, (kind, label, color, _) in enumerate(kinds):
+        vals = [by.get((t, kind), {}).get("dTWA", np.nan) for t in tasks]
+        pos = y0 + (1 - i) * height
+        ax.barh(pos, vals, height=height * 0.86, color=color, label=label, zorder=3)
+        for y, v in zip(pos, vals):
+            if np.isfinite(v):
+                ax.text(v + (0.0006 if v >= 0 else -0.0006), y, f"{v:+.3f}", va="center",
+                        ha="left" if v >= 0 else "right", color=_MUTED, fontsize=8, zorder=4)
+    ax.axvline(0, color=_INK, lw=1.4, zorder=2)
+    ax.set_yticks(y0)
+    ax.set_yticklabels(tasks)
+    ax.set_xlabel("headline TWA, as a change from the median heuristic", color=_MUTED, fontsize=9)
+    ax.set_title("and what that is worth", color=_INK, fontsize=11, loc="left")
+    ax.margins(x=0.1)
+    _style(ax)
+    # No second legend: the bars carry the same three colours as the marks above, in the
+    # same order, and a box here has nowhere to sit that does not cover a bar.
+
+    fig.text(0.005, 0.99, "The log-determinant criterion against the median heuristic, "
+                          f"{summary['Method'].iloc[0]} on {len(tasks)} tasks",
+             color=_INK, fontsize=13, ha="left", va="top")
+    fig.text(0.005, 0.945, "Which bandwidths each rule picks, per task. Both oracle rules are "
+                           "chosen by the test-set TWA they produce and cannot be run in practice; "
+                           "they bound what the criterion could reach.",
+             color=_MUTED, fontsize=9, ha="left", va="top")
+    leg = fig.legend(handles, labels_, loc="upper left", bbox_to_anchor=(0.005, 0.90), ncol=4,
+                     fontsize=9, labelcolor=_MUTED)
+    leg.set_frame_on(False)
+    _save(fig, stem)
+    plt.close(fig)
+
+
+def plot_rho(rhos: dict, alpha: float, stem: str) -> None:
+    """Where in the ``(alpha, beta)`` box the criterion agrees with TWA -- on each task.
+
+    This is the strong form of the question. The argmax comparison is one cell out of 289
+    and can land well by luck; a rank correlation over the whole grid says whether the
+    criterion orders kernels the way the benchmark does. Signed quantity with a meaningful
+    zero, so: diverging ramp, neutral midpoint, one symmetric scale shared by all panels so
+    the tasks can be read against each other.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    cmap = LinearSegmentedColormap.from_list("ldk_div", [_ACCENT, "#f2f1ec", _SECOND])
+    names = list(rhos)
+    span = max(abs(float(r["spearman"].min())) for r in rhos.values() if len(r))
+    span = max(span, max(abs(float(r["spearman"].max())) for r in rhos.values() if len(r)))
+
+    fig, axes = plt.subplots(1, len(names), figsize=(2.7 * len(names) + 2.2, 3.9), squeeze=False)
+    for ax, name in zip(axes[0], names):
+        piv = rhos[name].pivot(index="alpha", columns="beta", values="spearman")
+        Z = piv.to_numpy(float)
+        X, Y = np.log2(piv.columns.to_numpy(float)), np.log2(piv.index.to_numpy(float))
+        mesh = ax.pcolormesh(X, Y, Z, cmap=cmap, shading="nearest", vmin=-span, vmax=span)
+        # The headline setting, and the best cell: two rings, so "the criterion is a decent
+        # proxy somewhere" and "it is a decent proxy where we ran it" stay separate claims.
+        j, i = np.unravel_index(int(np.argmax(Z)), Z.shape)
+        ax.plot(X[i], Y[j], "s", color=_INK, ms=9, markerfacecolor="none", markeredgewidth=1.8)
+        ax.plot(0.0, np.log2(alpha), "o", color=_INK, ms=9, markerfacecolor="none", markeredgewidth=1.8)
+        ax.set_xticks(X)
+        ax.set_xticklabels([f"{v:g}" for v in piv.columns], rotation=90)
+        ax.set_yticks(Y)
+        ax.set_yticklabels([f"{v:g}" for v in piv.index])
+        ax.set_xlabel(r"$\beta$", color=_MUTED, fontsize=9)
+        ax.set_title(f"{name}   (best {Z.max():+.2f})", color=_INK, fontsize=10, loc="left")
+        _style(ax)
+        if ax is axes[0][0]:
+            ax.set_ylabel(r"$\alpha$", color=_MUTED, fontsize=9)
+    # The colour bar gets its own axes rather than stealing space from the last panel: with
+    # `ax=axes[0]` it is laid out over the panels, and a later subplots_adjust cannot move it.
+    fig.subplots_adjust(left=0.055, right=0.88, top=0.68, bottom=0.22, wspace=0.28)
+    bar = fig.colorbar(mesh, cax=fig.add_axes([0.905, 0.22, 0.013, 0.46]))
+    bar.set_label(r"Spearman $\rho$ between $J(\theta)$ and TWA, over the 289 cells",
+                  color=_MUTED, fontsize=8)
+    bar.ax.tick_params(colors=_MUTED, labelsize=7)
+    bar.outline.set_visible(False)
+    fig.text(0.005, 0.99, "Does the criterion rank kernels the way the benchmark does?",
+             color=_INK, fontsize=13, ha="left", va="top")
+    fig.text(0.005, 0.87, f"Circle: the setting used for the headline rows ($\\alpha$={alpha:g}, "
+                          r"$\beta$=1). Square: the best cell on that task. Blue = agrees, "
+                          "orange = disagrees.", color=_MUTED, fontsize=9, ha="left", va="top")
+    _save(fig, stem)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------------- main
+def run_task(task: str, method: str, seed: int, force: bool, cache_only: bool,
+             no_plots: bool = False, alpha: float = ALPHA_DEFAULT,
+             group: int = GROUP,
+             loo: str = "step") -> tuple[pd.DataFrame, list[dict], pd.DataFrame]:
+    """Everything for one (task, method): the grid, the sweeps, the plots, the summary rows."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cal = prepare(task, method, seed)
+    tag = "" if loo == "step" else f"__loo_{loo}"
+    crit_path = CACHE_DIR / f"{task}__{method}__criterion{tag}__seed{seed}.csv"
+    if crit_path.exists() and not force:
+        crit = pd.read_csv(crit_path)
+    else:
+        started = time.time()
+        crit = criterion_grid(cal, blocked=(loo == "episode"))
+        crit.to_csv(crit_path, index=False)
+        print(f"criterion grid: {len(crit)} cells in {time.time() - started:.1f}s -> "
+              f"{os.path.relpath(crit_path, ROOT_DIR)}")
+
+    fac_path = CACHE_DIR / f"{task}__{method}__factors__seed{seed}.csv"
+    if fac_path.exists() and not force:
+        fac = pd.read_csv(fac_path)
+    else:
+        fac = factor_grid(cal)
+        fac.to_csv(fac_path, index=False)
+    crit = crit.merge(fac, on=["exp_o", "exp_A"], how="left")
+
+    cells = twa_landscape(task, method, seed, force=force, cache_only=cache_only, group=group)
+    df = merge(crit, reduce_landscape(cells))
+    refs = report_landscape(df, cal)
+    med, best = refs["median"], refs["best"]
+
+    report_alpha(df, med)
+    report_beta(df, med, alpha)
+    report_balance(df, alpha)
+    rho = report_proxy(df)
+
+    full = sweep(df)
+    full.insert(0, "Task", task)
+    full.insert(1, "Method", method)
+    full.to_csv(CACHE_DIR / f"{task}__{method}__sweep{tag}__seed{seed}.csv", index=False)
+
+    # The best (alpha, beta) in the whole sweep, chosen by the TWA it produces. That is an
+    # oracle over the criterion's own knobs -- it cannot be run in practice -- and it is
+    # here as an upper bound: if even this does not clear the median heuristic, no setting
+    # of the two knobs does.
+    knob_best = full.loc[full["TWA"].idxmax()] if full["TWA"].notna().any() else None
+    rows = [
+        summary_row(task, method, seed, "median", "median heuristic", med),
+        summary_row(task, method, seed, "criterion", f"criterion (alpha={alpha:g}, beta=1)",
+                    select(df, alpha, 1.0)),
+    ]
+    if knob_best is not None:
+        rows.append(summary_row(
+            task, method, seed, "criterion_best",
+            f"criterion, best knobs (alpha={knob_best['alpha']:g}, beta={knob_best['beta']:g})",
+            knob_best))
+    rows.append(summary_row(task, method, seed, "oracle", "best bandwidths in grid", best))
+
+    df_q = report_tau(crit, cells, alpha, 1.0)
+    if df_q is not None:
+        rows += [
+            summary_row(task, method, seed, "median_tau", "median heuristic, tau threshold",
+                        _cell(df_q, 0.0, 0.0)),
+            summary_row(task, method, seed, "criterion_tau",
+                        f"criterion (alpha={alpha:g}, beta=1), tau threshold", select(df_q, alpha, 1.0)),
+        ]
+
+    if not no_plots:
+        stem = f"{task}__{method}{tag}"
+        plot_landscape(df, cal, alpha, 1.0, f"{stem}__landscape")
+        plot_sweeps(df, cal, alpha, f"{stem}__sweeps")
+        plot_proxy(df, cal, alpha, 1.0, f"{stem}__proxy")
+    return df, rows, rho
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="logdet_kernel", description=__doc__)
-    parser.add_argument("--task", default="push_chair", choices=run_mod.ALL_TASKS)
-    parser.add_argument("--methods", nargs="+", default=["kern_cd_obs"],
-                        help="base method name(s); each is run alongside its _logdet twin")
+    parser.add_argument("--task", nargs="+", default=["pretzel"], choices=run_mod.ALL_TASKS)
+    parser.add_argument("--method", nargs="+", default=["kern_cd_flat"])
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--alpha", type=float, default=ALPHA_DEFAULT,
+                        help="tail fraction for the beta sweep and the headline rows")
+    parser.add_argument("--loo", default="step", choices=["step", "episode"],
+                        help="hold out one step (kern_cd's own definition) or one whole episode")
+    parser.add_argument("--group", type=int, default=GROUP,
+                        help="cells per evaluation call; lower it on the big tasks to cap memory")
+    parser.add_argument("--report", action="store_true", help="report cached cells only")
     parser.add_argument("--force", action="store_true", help="ignore the cache")
-    parser.add_argument("--check-only", action="store_true", help="verify the criterion's algebra and exit")
-    parser.add_argument("--summary", action="store_true", help="roll up every cached grid and exit")
-    parser.add_argument("--all-seeds", action="store_true",
-                        help="--summary: average over every cached seed instead of only --seed")
-    parser.add_argument("--grid-n", type=int, default=None, help="grid points per bandwidth")
-    parser.add_argument("--no-plot", action="store_true")
-    parser.add_argument("--no-ridge-scan", action="store_true",
-                        help="skip the ridge / tau sensitivity tables")
-    parser.add_argument("--sweep", action="store_true",
-                        help="score the whole sigma_o axis end-to-end instead (the control arm)")
+    parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument("--check-only", action="store_true", help="run the checks and exit")
     args = parser.parse_args(argv)
 
-    if args.summary:
-        return summarise(None if args.all_seeds else args.seed)
-
-    check_criterion()
+    started = time.time()
+    check_cvar()
     if args.check_only:
+        cal = prepare(args.task[0], args.method[0], args.seed)
+        check_grid(cal)
+        check_block_loo(cal)
         return 0
 
-    discover()
-    unknown = [m for m in args.methods if m not in REGISTRY]
-    if unknown:
-        print(f"unknown method(s) {unknown}; registered: {sorted(REGISTRY)}", file=sys.stderr)
-        return 1
+    rows, rhos = [], {}
+    for task in args.task:
+        for method in args.method:
+            _, new, rho = run_task(task, method, args.seed, args.force, args.report, args.no_plots,
+                                   alpha=args.alpha, group=args.group, loo=args.loo)
+            rows += new
+            rhos[task if len(args.method) == 1 else f"{task} / {method}"] = rho
 
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    if args.sweep:
-        for base_name in args.methods:
-            run_sweep(args.task, base_name, args.seed, args.force, plot=not args.no_plot)
-        return 0
-
-    for base_name in args.methods:
-        cls = make_variant(base_name)
-        if args.grid_n:
-            cls.logdet_grid_n = args.grid_n
-
-    names = [n for b in args.methods for n in (b, b + SUFFIX)]
-    cache = {n: os.path.join(CACHE_DIR, f"{args.task}__{n}__seed{args.seed}.csv") for n in names}
-
-    grids: dict[str, pd.DataFrame] = {}
-    impls: dict = {}
-    if args.force or not all(os.path.exists(p) for p in cache.values()):
-        _install_impl_capture()
-        _keep_tuning_inputs()
-        print(f"\nevaluating {names} on {args.task} (seed {args.seed}) ...")
-        results = run_mod._evaluate_task(names, args.task, args.seed, {})
-        impls = dict(_LAST_IMPLS)
-        for n in names:
-            grids[n] = grid(n, args.task, results)
-            grids[n].to_csv(cache[n], index=False)
-        print(f"cached {len(names)} grids -> {os.path.relpath(CACHE_DIR, ROOT_DIR)}/")
-    else:
-        for n in names:
-            grids[n] = pd.read_csv(cache[n])
-        print(f"\nloaded cached grids for {names} on {args.task} "
-              f"(--force to re-run; the tuning diagnostics need a re-run)")
-
-    if impls:
-        report_tuning(args.task, impls)
-        report_loo_shift(args.task, impls)
-        if not args.no_ridge_scan:
-            report_ridge_sensitivity(impls)
-            report_tau_robustness(impls)
-        for base_name in args.methods:
-            res = getattr(impls.get(base_name + SUFFIX), "_logdet_result", None)
-            if res is None:
-                continue
-            res.scan.to_csv(os.path.join(CACHE_DIR, f"{args.task}__{base_name}__scan__seed{args.seed}.csv"),
-                            index=False)
-            if not args.no_plot:
-                plot_landscape(res, args.task, base_name,
-                               str(HERE / f"{args.task}__{base_name}__landscape.png"))
-
-    print(f"\n=== headline metrics, {args.task} (seed {args.seed}) ===")
-    print("best (window, threshold style) by quantile-averaged TWA, as in paper_table.py\n")
-    table = pd.DataFrame({n: headline(grids[n]) for n in names}).T
-    table.index.name = "Method"
-    print(table.to_string(float_format=lambda v: f"{v:.4f}"))
-
-    print("\n--- log-det-tuned minus median-heuristic ---")
-    for base_name in args.methods:
-        a, b = headline(grids[base_name]), headline(grids[base_name + SUFFIX])
-        deltas = {k: float(b[k]) - float(a[k]) for k in ("TWA", "Accuracy", "Det. Time", "TWA_gridmax", "TWA_gridmean")}
-        print(f"  {base_name:<16} " + "  ".join(f"{k} {v:+.4f}" for k, v in deltas.items()))
-
-    print("\n--- paired by (threshold, quantile, window): TWA delta over the whole grid ---")
-    keys = ["Threshold", "Quantile", "Window"]
-    for base_name in args.methods:
-        merged = grids[base_name].merge(grids[base_name + SUFFIX], on=keys, suffixes=("_md", "_ld"))
-        d = merged["TWA_ld"] - merged["TWA_md"]
-        print(f"  {base_name:<16} n={len(d)}  mean {d.mean():+.4f}  median {d.median():+.4f}  "
-              f"win {np.mean(d > 0):.0%} / tie {np.mean(d == 0):.0%} / loss {np.mean(d < 0):.0%}  "
-              f"[{d.min():+.4f}, {d.max():+.4f}]")
-
+    summary = pd.DataFrame(rows)
+    # Every rule is judged against the median heuristic on its own task, which is the only
+    # comparison the spec asks for; TWA levels are not comparable across tasks.
+    base = summary[summary["Rule"] == "median heuristic"].set_index(["Task", "Method"])["TWA"]
+    summary.insert(summary.columns.get_loc("Accuracy"), "dTWA",
+                   summary["TWA"] - summary.set_index(["Task", "Method"]).index.map(base))
+    print("\n=== summary: the effect of the tuning rule on the headline benchmark scores ===")
+    print("  dTWA is against the median heuristic on the same task; the 'tau threshold' rows use "
+          "only\n  FIPER's 1-alpha quantile instead of the 10-quantile average")
+    print(summary.drop(columns=["Kind"]).to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    path = CACHE_DIR / ("summary.csv" if args.loo == "step" else f"summary__loo_{args.loo}.csv")
+    summary.to_csv(path, index=False)
+    print(f"\n-> {os.path.relpath(path, ROOT_DIR)}")
+    if not args.no_plots and summary["Task"].nunique() > 1:
+        stem = f"summary__{'_'.join(args.method)}" + ("" if args.loo == "step" else f"__loo_{args.loo}")
+        plot_across_tasks(summary, args.alpha, stem)
+        plot_rho(rhos, args.alpha, f"{stem}__rho")
+    print(f"total wall clock: {time.time() - started:.0f}s")
     return 0
 
 
