@@ -2,7 +2,7 @@
 
 Our methods, defined in [methods.md](../methods.md), don't seem able to meaningfully improve scores on the FIPER benchmark, even after extensive tinkering. Let's try to determine how intrinsically hard this benchmark is.
 
-To do so, let's see how well an "oracle" method does that has access to the success/failure labels. So, the oracle is a binary classifier / two-sample test that has access to
+To do so, let's see how well an "oracle" method does that has access to the success/failure labels. So, the oracle is a binary classifier that has access to
 - FIPER's train data (which is the same as calibration data in FIPER): treat these as the "nominal" class (let's ignore the fact that Push T's train data is contaminated by failures)
 - FIPER's test data: a mix of success and fail episodes, with labels
 
@@ -24,18 +24,23 @@ We will break down the answers along the following axes:
 ### Similarity score
 
 What is a good similarity / dissimilarity score for this experiment?
-- Let's start with AUROC from a random forest model
+- We use the AUROC of a binary classifier (specified below)
 - Use $k$-fold CV to obtain this AUROC (you can choose $k$ appropriate to the size of the data)
 - CV should be done over episodes
 
 ### Which features / inputs should our separability model have access to?
 
 We consider two cases.
-- First, we answer Q1 and Q2 using only the observation embeddings as input
-- Second, we answer Q3 by using the (task-space coordinates of) action chunks as inputs too. 
+- **Case 1:** we answer Q1 and Q2 using only the observation embeddings as input
+- **Case 2:** we answer Q3 by using the (task-space coordinates of) action chunks as inputs too. 
     - To this end, we compute the similarity scores using observation embeddings *and* action chunks.
-    - For simplicity, combine these features by concatenation; to answer Q3, we restrict ourselves to the Stacking, Pretzel, and Sorting tasks, which have small ($B <= 32$) batches
-    - Both feature sets are scored in the same run, on the same subsampled steps and the same CV folds, so the two AUROCs differ only in the features.
+    - For the action chunk batches, summarize via the Kernel Mean Embedding:
+    $$
+    \mu_A = \frac{1}{B}\sum_b \varphi\big(\operatorname{vec}(a_b)\big).
+    $$
+    - Use $M=256$ Random Fourier Features
+    - Concatenate the observation embedding and KME; for Case 2 we use these combined features as inputs
+    - Both feature sets (Case 1 and Case 2) are scored in the same run, on the same subsampled steps and the same CV folds, so the two AUROCs differ only in the features.
     - The quantity of interest is the change in the failure-minus-success gap, not the change in the failure AUROC alone — the success curve controls for calibration-vs-test shift that has nothing to do with failure. 
     
 From these scores we subtract the observation-only scores obtained in the previous case, in order to estimate the benefit of the action channels.
@@ -45,7 +50,12 @@ From these scores we subtract the observation-only scores obtained in the previo
 At normalized time $t$, our separability model trains on a pool of all steps from the appropriate episodes up to this normalized time step
     - (episode length is a confound for success / failure, since failed episodes tend to be significantly longer - but this need not concern us here since our similarity model trains on pooled steps instead of whole episodes)
 
-## Deliverable
+### Which model(s)?
+
+- We are mainly interested in a random forest
+- But as a sanity check, try a logistic regression as well
+
+## Deliverables (for each model)
 
 Two plots, each saved as png and pdf, each with 5 subplots stacked vertically,
 one per task, x-axis = normalized episode time. Tasks out of scope for a plot get
@@ -65,7 +75,7 @@ not build it from the spreads of the four AUROCs separately.
 
 ## Instructions
 
-- Implement this experiment as a new script in my_experiments
+- Implement this experiment as a new experiment in my_experiments/
 - Do not modify existing files
 - Prioritize making the script cheap to run
 
