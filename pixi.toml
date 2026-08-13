@@ -32,6 +32,7 @@ cuda-version = "12.8.*"
 # numpy <2.5, so numpy is held one minor behind latest.
 numba = "*"
 numba-cuda = "*"
+streamlit = ">=1.61.1,<2"
 
 [pypi-dependencies]
 # cu128 wheel from PyPI, not conda-forge: needs sm_120 kernels (RTX 5090)

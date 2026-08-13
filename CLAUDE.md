@@ -1,0 +1,5 @@
+- Do not modify files in specs/
+- Limit documentation and comments to
+    - one-sentence docstrings for functions / classes
+    - terse inline comments for tricky algorithm steps
+    - one-sentence descriptions for script files, placed at the top

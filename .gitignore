@@ -11,3 +11,6 @@ docs/*.pdf
 .pixi/*
 !.pixi/config.toml
 scratchpad/
+
+# regenerable experiment caches (figures alongside the scripts stay tracked)
+my_experiments/*/cache/
